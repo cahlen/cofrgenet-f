@@ -1,0 +1,17 @@
+services:
+  dev:
+    build: .
+    volumes:
+      - .:/workspace
+      - ./data:/workspace/data
+      - ./checkpoints:/workspace/checkpoints
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ipc: host
+    stdin_open: true
+    tty: true

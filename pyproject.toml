@@ -1,0 +1,9 @@
+[project]
+name = "cofrgenet-f"
+version = "0.1.0"
+description = "First open-source CoFrGeNet-F: Continued Fraction FFN for Language Models"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
