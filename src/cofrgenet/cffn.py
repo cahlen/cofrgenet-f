@@ -7,7 +7,7 @@ Architecture:
 where each a^(j) = W^(j) · x, and f̃ is the continued fraction computed
 via continuant polynomials.
 
-Parameter count: L*p*(d+1) + p² + L*p  (vs standard FFN: 2*α*p² where α=4)
+Parameter count: L*p*(d+1) + 2p² + L*p  (vs standard FFN: 2*α*p² where α=4)
 """
 
 import torch
@@ -34,6 +34,11 @@ class Cffn(nn.Module):
 
         # Direct linear path: U (p -> p)
         self.U = nn.Linear(dim, dim, bias=False)
+
+        # Gating projection: G (p -> p)
+        # Paper: "input to the ladders is a gated non-expanded representation"
+        # gated_x = sigmoid(G·x) ⊙ x
+        self.gate_proj = nn.Linear(dim, dim, bias=False)
 
         # Ladder weight matrices: W^(j) maps input to (d+1) partial denominators
         # Row 0 is a_0 (linear term), rows 1..d are a_1..a_d (fraction terms)
@@ -91,13 +96,16 @@ class Cffn(nn.Module):
         Returns:
             (batch, seq_len, dim)
         """
-        # Direct linear path
+        # Direct linear path (uses raw x)
         linear_out = self.U(x)  # (batch, seq_len, dim)
 
-        # Continued fraction ladders
+        # Gated input for ladders: sigmoid(G·x) ⊙ x
+        gated_x = torch.sigmoid(self.gate_proj(x)) * x  # (batch, seq_len, dim)
+
+        # Continued fraction ladders (use gated input)
         ladder_outputs = []
         for j in range(self.num_ladders):
-            a = self.ladder_weights[j](x)  # (batch, seq_len, d+1)
+            a = self.ladder_weights[j](gated_x)  # (batch, seq_len, d+1)
             # a_0 is the linear term, a_1..a_d form the continued fraction
             a_0 = a[..., 0]                # (batch, seq_len)
             a_cf = a[..., 1:]              # (batch, seq_len, d)

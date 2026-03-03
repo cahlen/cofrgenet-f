@@ -29,16 +29,17 @@ class TestCffnParameters:
     """Test parameter counts match expected formulas."""
 
     def test_parameter_count(self):
-        """Params should be L*p*(d+1) + p*p + L*p.
+        """Params should be L*p*(d+1) + 2*p*p + L*p.
 
         - ladder_weights: L linear layers, each p -> (d+1), no bias = L*p*(d+1)
         - U: p -> p, no bias = p*p
+        - gate_proj: p -> p, no bias = p*p
         - V: L -> p, no bias = L*p
         """
         p, L, d = 768, 3, 5
         cffn = Cffn(dim=p, num_ladders=L, depth=d)
         total = sum(param.numel() for param in cffn.parameters())
-        expected = L * p * (d + 1) + p * p + L * p
+        expected = L * p * (d + 1) + 2 * p * p + L * p
         assert total == expected, f"Got {total}, expected {expected}"
 
     def test_fewer_params_than_ffn(self):
@@ -89,12 +90,13 @@ class TestCffnFreezing:
         loss = y.sum()
         loss.backward()
 
-        # U and V should have gradients (depth 0)
+        # U, V, and gate_proj should have gradients (depth 0)
         assert cffn.U.weight.grad is not None
         assert cffn.V.weight.grad is not None
+        assert cffn.gate_proj.weight.grad is not None
 
     def test_freeze_all_depths(self):
-        """At depth 0, only linear components (U, V, a_0 row) should train."""
+        """At depth 0, only linear components (U, V, gate_proj, a_0 row) should train."""
         p = 64
         cffn = Cffn(dim=p, num_ladders=3, depth=5)
         cffn.set_active_depth(0)
@@ -104,9 +106,10 @@ class TestCffnFreezing:
         loss = y.sum()
         loss.backward()
 
-        # U and V should have gradients
+        # U, V, and gate_proj should have gradients
         assert cffn.U.weight.grad is not None
         assert cffn.V.weight.grad is not None
+        assert cffn.gate_proj.weight.grad is not None
 
     def test_unfrozen_all(self):
         """With max depth, all parameters should get gradients."""
@@ -121,3 +124,36 @@ class TestCffnFreezing:
 
         for name, param in cffn.named_parameters():
             assert param.grad is not None, f"No gradient for {name}"
+
+
+class TestCffnGating:
+    """Test the gating mechanism."""
+
+    def test_gate_proj_exists(self):
+        """gate_proj should exist with correct shape (p, p)."""
+        p = 64
+        cffn = Cffn(dim=p, num_ladders=3, depth=5)
+        assert hasattr(cffn, 'gate_proj')
+        assert cffn.gate_proj.weight.shape == (p, p)
+
+    def test_gated_output_is_nonlinear(self):
+        """At depth 0, cffn(2x) != 2*cffn(x) due to sigmoid gating.
+
+        Without gating, depth-0 Cffn is purely linear. The gate introduces
+        nonlinearity even before fraction depths are unfrozen.
+        """
+        p = 64
+        cffn = Cffn(dim=p, num_ladders=3, depth=5)
+        cffn.set_active_depth(0)
+
+        torch.manual_seed(123)
+        x = torch.randn(1, 4, p)
+
+        with torch.no_grad():
+            y1 = cffn(x)
+            y2 = cffn(2.0 * x)
+
+        # If linear: y2 == 2*y1. Gating makes this false.
+        assert not torch.allclose(y2, 2.0 * y1, atol=1e-5), (
+            "Cffn output is linear — gating is not working"
+        )
