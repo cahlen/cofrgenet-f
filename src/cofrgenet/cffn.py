@@ -1,13 +1,13 @@
 """Continued Fraction FFN (Cffn) — replaces standard Transformer FFN.
 
-Architecture:
+Architecture (paper eq. 8):
     y = U·x + V·z
-    z_j = a_0^(j) + f̃(a_1^(j), ..., a_d^(j))  for j = 1, ..., L
+    z_j = f̃(W^(j) ⊙ x)  for j = 1, ..., L
 
-where each a^(j) = W^(j) · x, and f̃ is the continued fraction computed
-via continuant polynomials.
+Each ladder is p-variate: W^(j) has shape (p, d) and multiplies element-wise
+with the p-dim input, producing p independent continued fractions per ladder.
 
-Parameter count: L*p*(d+1) + 2p² + L*p  (vs standard FFN: 2*α*p² where α=4)
+Parameter count: L*p*d + 2p² + p*L  (= L*p*(d+1) + 2p² per paper formula)
 """
 
 import torch
@@ -40,15 +40,18 @@ class Cffn(nn.Module):
         # gated_x = sigmoid(G·x) ⊙ x
         self.gate_proj = nn.Linear(dim, dim, bias=False)
 
-        # Ladder weight matrices: W^(j) maps input to (d+1) partial denominators
-        # Row 0 is a_0 (linear term), rows 1..d are a_1..a_d (fraction terms)
-        self.ladder_weights = nn.ModuleList([
-            nn.Linear(dim, depth + 1, bias=False)
+        # P-variate ladder weights: W^(j) shape (p, d) — element-wise multiply
+        # Each W[i, k] scales x[i] for depth k of the continued fraction
+        self.ladder_weights = nn.ParameterList([
+            nn.Parameter(torch.empty(dim, depth))
             for _ in range(num_ladders)
         ])
+        for w in self.ladder_weights:
+            nn.init.normal_(w, std=0.02)
 
-        # Combination layer: V (L -> p)
-        self.V = nn.Linear(num_ladders, dim, bias=False)
+        # Combination weights: V shape (p, L) — per-dimension weighting of ladders
+        self.V = nn.Parameter(torch.empty(dim, num_ladders))
+        nn.init.normal_(self.V, std=0.02)
 
         # Track active depth for dyadic schedule
         self._active_depth = depth
@@ -60,8 +63,8 @@ class Cffn(nn.Module):
 
         Args:
             active_depth: Maximum depth level with active gradients.
-                0 = only linear components (U, V, a_0 row of each ladder)
-                1..d = include fraction depths up to this level
+                0 = only linear components (U, V, gate_proj); all ladder columns masked
+                1..d = unmask ladder columns 0..active_depth-1
         """
         self._active_depth = active_depth
         # Remove old hooks
@@ -72,19 +75,17 @@ class Cffn(nn.Module):
         if active_depth >= self.depth:
             return  # All depths active, no masking needed
 
-        # Install gradient hooks to zero out frozen depth rows
-        for lw in self.ladder_weights:
-            def make_hook(layer, max_active):
+        # Install gradient hooks to zero out frozen depth columns
+        for w in self.ladder_weights:
+            def make_hook(max_active):
                 def hook(grad):
                     mask = torch.zeros_like(grad)
-                    # Row 0 (a_0) is always active
-                    mask[0, :] = 1.0
-                    # Rows 1..max_active are active (a_1..a_{max_active})
+                    # Columns 0..max_active-1 are active (depth 1..max_active)
                     if max_active > 0:
-                        mask[1:max_active + 1, :] = 1.0
+                        mask[:, :max_active] = 1.0
                     return grad * mask
                 return hook
-            h = lw.weight.register_hook(make_hook(lw, active_depth))
+            h = w.register_hook(make_hook(active_depth))
             self._grad_hooks.append(h)
 
     def forward(self, x):
@@ -97,22 +98,20 @@ class Cffn(nn.Module):
             (batch, seq_len, dim)
         """
         # Direct linear path (uses raw x)
-        linear_out = self.U(x)  # (batch, seq_len, dim)
+        linear_out = self.U(x)  # (B, S, p)
 
         # Gated input for ladders: sigmoid(G·x) ⊙ x
-        gated_x = torch.sigmoid(self.gate_proj(x)) * x  # (batch, seq_len, dim)
+        gated_x = torch.sigmoid(self.gate_proj(x)) * x  # (B, S, p)
 
-        # Continued fraction ladders (use gated input)
+        # P-variate continued fraction ladders
         ladder_outputs = []
         for j in range(self.num_ladders):
-            a = self.ladder_weights[j](gated_x)  # (batch, seq_len, d+1)
-            # a_0 is the linear term, a_1..a_d form the continued fraction
-            a_0 = a[..., 0]                # (batch, seq_len)
-            a_cf = a[..., 1:]              # (batch, seq_len, d)
-            z_j = a_0 + continued_fraction(a_cf, self.epsilon)  # (batch, seq_len)
+            # Element-wise: a[b,s,i,k] = gated_x[b,s,i] * W[i,k]
+            a = gated_x.unsqueeze(-1) * self.ladder_weights[j]  # (B,S,p,1)*(p,d) → (B,S,p,d)
+            z_j = continued_fraction(a, self.epsilon)  # (B,S,p,d) → (B,S,p)
             ladder_outputs.append(z_j)
 
-        z = torch.stack(ladder_outputs, dim=-1)  # (batch, seq_len, L)
-        combined = self.V(z)                       # (batch, seq_len, dim)
+        z = torch.stack(ladder_outputs, dim=-1)  # (B, S, p, L)
+        combined = (z * self.V).sum(dim=-1)  # (B, S, p)
 
         return linear_out + combined

@@ -209,3 +209,22 @@ class TestBatched:
         grad_individual = torch.cat(grads, dim=0)
 
         assert torch.allclose(grad_batch, grad_individual, atol=1e-6)
+
+    def test_p_variate_shape(self):
+        """(B, S, p, d) input should produce (B, S, p) output — p-variate ladders."""
+        B, S, p, d = 2, 8, 64, 5
+        torch.manual_seed(42)
+        a = torch.randn(B, S, p, d) * 2 + 3
+        result = continued_fraction(a)
+        assert result.shape == (B, S, p)
+
+    def test_p_variate_gradient(self):
+        """Gradients should flow through (B, S, p, d) shaped inputs."""
+        B, S, p, d = 2, 4, 32, 5
+        torch.manual_seed(42)
+        a = (torch.randn(B, S, p, d) * 2 + 3).requires_grad_(True)
+        result = continued_fraction(a)
+        result.sum().backward()
+        assert a.grad is not None
+        assert a.grad.shape == (B, S, p, d)
+        assert torch.isfinite(a.grad).all()

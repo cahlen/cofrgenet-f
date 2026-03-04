@@ -1,6 +1,7 @@
 """Tests for the Continued Fraction FFN (Cffn) layer."""
 
 import torch
+import torch.nn as nn
 import pytest
 from src.cofrgenet.cffn import Cffn
 
@@ -29,17 +30,17 @@ class TestCffnParameters:
     """Test parameter counts match expected formulas."""
 
     def test_parameter_count(self):
-        """Params should be L*p*(d+1) + 2*p*p + L*p.
+        """Params should be L*p*d + 2*p*p + p*L.
 
-        - ladder_weights: L linear layers, each p -> (d+1), no bias = L*p*(d+1)
+        - ladder_weights: L parameters, each (p, d) = L*p*d
         - U: p -> p, no bias = p*p
         - gate_proj: p -> p, no bias = p*p
-        - V: L -> p, no bias = L*p
+        - V: (p, L) = p*L
         """
         p, L, d = 768, 3, 5
         cffn = Cffn(dim=p, num_ladders=L, depth=d)
         total = sum(param.numel() for param in cffn.parameters())
-        expected = L * p * (d + 1) + 2 * p * p + L * p
+        expected = L * p * d + 2 * p * p + p * L
         assert total == expected, f"Got {total}, expected {expected}"
 
     def test_fewer_params_than_ffn(self):
@@ -54,6 +55,13 @@ class TestCffnParameters:
         assert cffn_params < ffn_params, (
             f"Cffn ({cffn_params:,}) should have fewer params than FFN ({ffn_params:,})"
         )
+
+    def test_paper_formula_equivalence(self):
+        """L*p*d + 2*p*p + p*L should equal L*p*(d+1) + 2*p*p (paper formula)."""
+        p, L, d = 768, 3, 5
+        our_formula = L * p * d + 2 * p * p + p * L
+        paper_formula = L * p * (d + 1) + 2 * p * p
+        assert our_formula == paper_formula
 
 
 class TestCffnGradients:
@@ -78,11 +86,11 @@ class TestCffnFreezing:
     """Test depth-based parameter freezing for dyadic schedule."""
 
     def test_freeze_depth(self):
-        """Freezing a depth level should zero out those gradients."""
+        """Freezing to depth 1 should zero out columns 1..d-1 gradients."""
         p = 64
         cffn = Cffn(dim=p, num_ladders=3, depth=5)
 
-        # Freeze depth levels 2-5 (only allow depth 0 and 1)
+        # Allow depth 0 (linear) and depth 1 (column 0 of ladder weights)
         cffn.set_active_depth(1)
 
         x = torch.randn(2, 8, p)
@@ -90,13 +98,18 @@ class TestCffnFreezing:
         loss = y.sum()
         loss.backward()
 
-        # U, V, and gate_proj should have gradients (depth 0)
+        # U, V, and gate_proj should have gradients
         assert cffn.U.weight.grad is not None
-        assert cffn.V.weight.grad is not None
+        assert cffn.V.grad is not None
         assert cffn.gate_proj.weight.grad is not None
 
+        # Ladder weights: column 0 should have grad, columns 1..4 should be zero
+        for w in cffn.ladder_weights:
+            assert w.grad[:, 0].abs().sum() > 0, "Column 0 should have gradients"
+            assert w.grad[:, 1:].abs().sum() == 0, "Columns 1..4 should be zero"
+
     def test_freeze_all_depths(self):
-        """At depth 0, only linear components (U, V, gate_proj, a_0 row) should train."""
+        """At depth 0, all ladder columns should be masked (only U, V, gate_proj train)."""
         p = 64
         cffn = Cffn(dim=p, num_ladders=3, depth=5)
         cffn.set_active_depth(0)
@@ -108,8 +121,12 @@ class TestCffnFreezing:
 
         # U, V, and gate_proj should have gradients
         assert cffn.U.weight.grad is not None
-        assert cffn.V.weight.grad is not None
+        assert cffn.V.grad is not None
         assert cffn.gate_proj.weight.grad is not None
+
+        # All ladder columns should be zeroed
+        for w in cffn.ladder_weights:
+            assert w.grad.abs().sum() == 0, "All ladder grads should be zero at depth 0"
 
     def test_unfrozen_all(self):
         """With max depth, all parameters should get gradients."""
@@ -157,3 +174,41 @@ class TestCffnGating:
         assert not torch.allclose(y2, 2.0 * y1, atol=1e-5), (
             "Cffn output is linear — gating is not working"
         )
+
+
+class TestCffnPVariate:
+    """Test p-variate ladder behavior."""
+
+    def test_ladder_output_is_p_dimensional(self):
+        """Each ladder should produce a p-dim output, not a scalar."""
+        p = 64
+        L = 3
+        d = 5
+        cffn = Cffn(dim=p, num_ladders=L, depth=d)
+
+        x = torch.randn(2, 8, p)
+        gated_x = torch.sigmoid(cffn.gate_proj(x)) * x
+
+        # Manually compute one ladder to verify shape
+        a = gated_x.unsqueeze(-1) * cffn.ladder_weights[0]  # (B,S,p,d)
+        assert a.shape == (2, 8, p, d)
+
+        from src.cofrgenet.continuant import continued_fraction
+        z = continued_fraction(a, cffn.epsilon)
+        assert z.shape == (2, 8, p), f"Expected (2, 8, {p}), got {z.shape}"
+
+    def test_ladder_weights_are_elementwise(self):
+        """Ladder weights should be (p, d) parameters, not linear layers."""
+        p = 64
+        cffn = Cffn(dim=p, num_ladders=3, depth=5)
+        for w in cffn.ladder_weights:
+            assert isinstance(w, nn.Parameter)
+            assert w.shape == (p, 5)
+
+    def test_V_is_parameter(self):
+        """V should be a (p, L) parameter, not a linear layer."""
+        p = 64
+        L = 3
+        cffn = Cffn(dim=p, num_ladders=L, depth=5)
+        assert isinstance(cffn.V, nn.Parameter)
+        assert cffn.V.shape == (p, L)
