@@ -14,7 +14,7 @@ import argparse
 import numpy as np
 import torch
 import torch.nn.functional as F
-from safetensors.torch import save_file, load_file
+from safetensors.torch import save_model, load_file
 
 
 class ShardedDataLoader:
@@ -100,7 +100,7 @@ def configure_optimizer(model, weight_decay, lr, betas, device):
 def save_checkpoint(model, optimizer, step, loss, path):
     """Save model checkpoint as safetensors + optimizer state as .pt."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    save_file(model.state_dict(), path)
+    save_model(model, path)
     # Save optimizer state separately
     opt_path = path.replace(".safetensors", "_optim.pt")
     torch.save({"optimizer": optimizer.state_dict(), "step": step, "loss": loss}, opt_path)
