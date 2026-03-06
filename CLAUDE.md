@@ -2,9 +2,30 @@
 
 ## What This Project Is
 
-This is the **first open-source implementation** of CoFrGeNet-F, a continued fraction architecture that replaces Transformer FFN layers with continued fraction networks. Based on IBM Research's paper [arXiv:2601.21766](https://arxiv.org/abs/2601.21766) (January 2026). No public code exists — we are implementing from the paper's math.
+This is the **first open-source implementation** of CoFrGeNet-F, a continued fraction architecture that replaces Transformer FFN layers with continued fraction networks. Based on IBM Research's paper [arXiv:2601.21766](https://arxiv.org/abs/2601.21766) (January 2026). No public code exists — we implemented from the paper's math.
 
 **Goal:** Train a 125M-parameter CoFrGeNet-F model and a standard 125M Transformer baseline on identical data, then release both with a head-to-head comparison blog post and interactive Gradio demo.
+
+## Current Status (2026-03-05)
+
+### Completed
+- **All core architecture**: continuant.py, cffn.py, both models, configs, tests
+- **Data pipeline**: FineWeb-Edu 10BT downloaded and tokenized (100 train shards + 1 val shard in `data/tokenized/`)
+- **Training infrastructure**: shared training loop, dyadic schedule, checkpointing
+- **Baseline model**: Fully trained (19,073 steps on RTX 5090, ~19.7 hours, ~141K tok/s)
+- **Baseline evaluation**: WikiText-2 PPL 34.13, LAMBADA PPL 37.47, LAMBADA acc 19.15%
+- **Baseline released on HuggingFace** at `checkpoints/baseline/`
+- **GitHub Wiki**: 7 pages of detailed architecture + math documentation
+
+### In Progress
+- **CoFrGeNet-F training**: Running on H200 via Docker container `cofrgenet-train`. ~74K tok/s. Dyadic schedule depth 1 unfroze at step 9,537 (big loss spike, recovered), depth 2 unfroze at step 14,305 (smooth). Depths 3–5 still to come.
+
+### Remaining
+- `scripts/04_evaluate.py` — benchmark evaluation script
+- `scripts/05_generate_examples.py` — text generation comparison
+- `demo/app.py` — Gradio demo (side-by-side generation)
+- CoFrGeNet-F HuggingFace release
+- Blog post / technical write-up
 
 ## Architecture Overview
 
@@ -15,10 +36,10 @@ A standard Transformer block has two components: **Multi-Head Attention** and a 
 A continued fraction computes:
 
 ```
-f(a₀, a) = a₀ + 1/(a₁ + 1/(a₂ + ... + 1/a_d))
+f̃(a₁, ..., a_d) = 1/(a₁ + 1/(a₂ + ... + 1/a_d))
 ```
 
-where each `a_k = w_k · x` (learnable weight times input). The key insight: this can be expressed as a ratio of **continuant polynomials** `K`, computed via a simple recursion:
+where each `a_k = w_k · x` (learnable weight times input). This is computed via **continuant polynomials** `K`:
 
 ```
 K₀ = 1
@@ -26,7 +47,7 @@ K₁(a_d) = a_d
 K_k = a_{d-k+1} · K_{k-1} + K_{k-2}
 ```
 
-The continued fraction then equals `K_{d-1} / K_d`, and gradients are:
+The continued fraction equals `K_{d-1} / K_d`, and gradients (Proposition 1) are:
 
 ```
 ∂f̃/∂a_k = (-1)^k · [K_{d-k} / K_d]²
@@ -46,84 +67,114 @@ The paper tested three variants. CoFrGeNet-F (FFN-only replacement) is the best:
 
 CoFrGeNet-F beat the full 1.5B GPT2-xl on all 8 GLUE tasks and all 6 perplexity benchmarks.
 
-### Cffn Architecture (What We Implement)
+### Cffn Architecture (What We Implemented)
 
 The Cffn replaces a standard 2-layer FFN (`Linear(p, 4p) → GELU → Linear(4p, p)`) with:
 
-1. **L continued fraction ladders**, each of depth d, operating on the full p-dimensional input
-2. A **direct linear path** (skip connection through the fraction)
-3. A **linear combination layer** that merges ladder outputs
+1. **A direct linear path** `U` (p×p) — skip connection through the fraction
+2. **A gating projection** `G` (p×p) — `gated_x = sigmoid(G·x) ⊙ x`
+3. **L p-variate continued fraction ladders**, each of depth d, operating element-wise per hidden dimension
+4. **Combination weights** `V` (p×L) — per-dimension weighting of ladder outputs
 
 ```
 y = U·x + V·z
-where z_j = f̃(W^(j) · x)   for j = 1, ..., L
+where z_j = f̃(gated_x ⊙ W^(j))   for j = 1, ..., L
 ```
 
-- `U` ∈ R^{p×p} — direct linear path
-- `V` ∈ R^{p×L} — combination weights for ladder outputs
-- `W^(j)` ∈ R^{(d+1)×p} — weights for each ladder
+Each ladder is **p-variate**: `W^(j)` has shape `(p, d)` and multiplies element-wise with the p-dim gated input, producing p independent continued fractions per ladder.
 
-**Parameter count:** `L·p·(d+1) + 2p²` (vs standard FFN: `2·α·p²` where α=4)
+- `U` ∈ R^{p×p} — direct linear path (589,824 params)
+- `G` ∈ R^{p×p} — gate projection (589,824 params)
+- `W^(j)` ∈ R^{p×d} — weights for each ladder (3,840 params each)
+- `V` ∈ R^{p×L} — combination weights (2,304 params)
 
-For our 125M model (p=768): standard FFN per layer = 2×4×768² ≈ 4.7M params. With Cffn (L=3, d=5): L·p·(d+1) + 2p² = 3·768·6 + 2·768² ≈ 1.2M params — roughly **4x fewer per layer**.
+**Validated parameter count per Cffn layer:** `2p² + L·p·(d+1) = 2×768² + 3×768×6 = 1,193,472`
 
 ### Pole Avoidance
 
 Continued fractions can have poles (division by zero). The fix:
 
 ```python
-K_d = torch.sign(K_d) * torch.clamp(K_d.abs(), min=0.01)
+K_d_safe = torch.sign(K_d) * torch.clamp(K_d.abs(), min=0.01)
+K_d_safe = torch.where(K_d_safe == 0, torch.full_like(K_d_safe, epsilon), K_d_safe)
 ```
 
 ### Dyadic Training Schedule (CRITICAL)
 
-Without this, performance degrades 10-80%. The schedule progressively unfreezes continued fraction depth:
+Without this, performance degrades 10-80%. The schedule progressively unfreezes continued fraction depth via gradient hooks that mask frozen ladder weight columns:
 
 ```
-Depth 0 (linear component U): trained from step 0
+Depth 0 (linear components U, G, V): trained from step 0
 Depth i parameters: unfrozen at step (1 - 1/2^i) × total_steps
 ```
 
-For a 19,000-step training run:
-- Step 0: Only linear components train
-- Step 9,500: Depth 1 (first fraction level) unfreezes
-- Step 14,250: Depth 2 unfreezes
-- Step 16,625: Depth 3 unfreezes
-- Step 17,813: Depth 4 unfreezes
-- Step 18,406: Depth 5 unfreezes
+**Validated unfreeze steps** for our 19,073-step run:
 
-## Model Configurations
+| Depth | Step | % of training | Status |
+|-------|------|---------------|--------|
+| 0 (linear only) | 0 | 0% | ✅ Done |
+| 1 | 9,537 | 50.0% | ✅ Unfroze — loss spike 3.96→6.82, recovered in ~500 steps |
+| 2 | 14,305 | 75.0% | ✅ Unfroze — smooth, no visible spike |
+| 3 | 16,689 | 87.5% | Pending |
+| 4 | 17,881 | 93.75% | Pending |
+| 5 | 18,477 | 96.875% | Pending |
 
-### CoFrGeNet-F (125M target)
+## Validated Model Parameter Counts
 
-| Parameter | Value |
-|-----------|-------|
-| Layers | 12 |
-| Attention heads | 12 |
-| Hidden dim (p) | 768 |
-| Sequence length | 1024 |
-| Vocab size | 50,257 (GPT-2 tokenizer) |
-| Attention | Standard multi-head (unchanged) |
-| FFN replacement | Cffn with L=3 ladders, d=5 depth |
-| Dropout | 0.0 |
-| Bias | False |
+### Baseline Transformer: 124,337,664 parameters
 
-The exact parameter count will be lower than 125M due to the Cffn savings. This is expected and is the whole point — we compare against a standard 125M Transformer to show competitive quality at fewer parameters.
+| Component | Shape | Params |
+|-----------|-------|--------|
+| Token embedding | 50,257 × 768 | 38,597,376 |
+| Position embedding | 1,024 × 768 | 786,432 |
+| **Per block (×12):** | | |
+| └ LayerNorm 1 | 768 | 768 |
+| └ Attention QKV | 2,304 × 768 | 1,769,472 |
+| └ Attention out_proj | 768 × 768 | 589,824 |
+| └ LayerNorm 2 | 768 | 768 |
+| └ FFN fc1 | 3,072 × 768 | 2,359,296 |
+| └ FFN fc2 | 768 × 3,072 | 2,359,296 |
+| Block total | | 7,079,424 |
+| 12 blocks | | 84,953,088 |
+| Final LayerNorm | 768 | 768 |
+| LM head | tied with tok_emb | 0 |
+| **Total** | | **124,337,664** |
 
-### Baseline Transformer (125M)
+### CoFrGeNet-F: 82,036,224 parameters
 
-Standard GPT-2 Small architecture:
+| Component | Shape | Params |
+|-----------|-------|--------|
+| Token embedding | 50,257 × 768 | 38,597,376 |
+| Position embedding | 1,024 × 768 | 786,432 |
+| **Per block (×12):** | | |
+| └ LayerNorm 1 | 768 | 768 |
+| └ Attention QKV | 2,304 × 768 | 1,769,472 |
+| └ Attention out_proj | 768 × 768 | 589,824 |
+| └ LayerNorm 2 | 768 | 768 |
+| └ Cffn U | 768 × 768 | 589,824 |
+| └ Cffn gate_proj | 768 × 768 | 589,824 |
+| └ Cffn ladder_weights (×3) | 768 × 5 | 3,840 each (11,520) |
+| └ Cffn V | 768 × 3 | 2,304 |
+| Block total | | 3,554,304 |
+| 12 blocks | | 42,651,648 |
+| Final LayerNorm | 768 | 768 |
+| LM head | tied with tok_emb | 0 |
+| **Total** | | **82,036,224** |
 
-| Parameter | Value |
-|-----------|-------|
-| Layers | 12 |
-| Attention heads | 12 |
-| Hidden dim | 768 |
-| FFN inner dim | 3072 (4× expansion) |
-| Sequence length | 1024 |
-| Vocab size | 50,257 |
-| Dropout | 0.0 |
-| Bias | False |
+**Reduction**: 42,301,440 fewer params (34.0%). FFN→Cffn ratio: 3.95×.
+
+## Baseline Results
+
+| Benchmark | Metric | Value |
+|-----------|--------|-------|
+| WikiText-2 | Perplexity | **34.13** |
+| WikiText-103 | Perplexity | **34.13** |
+| LAMBADA | Perplexity | **37.47** |
+| LAMBADA | Accuracy | **19.15%** |
+| Throughput | tok/s | 442,851 |
+| Generation speed | ms/tok | 1.41 |
+
+Trained on RTX 5090 (32 GB), 19,073 steps, ~19.7 hours, ~141K tok/s.
 
 ## Training Recipe
 
@@ -133,14 +184,14 @@ Both models trained identically except for the FFN architecture.
 |---------------|-------|
 | **Dataset** | FineWeb-Edu sample-10BT (~10B tokens, ~28.5 GB) |
 | **Tokenizer** | GPT-2 (`tiktoken.get_encoding("gpt2")`) |
-| **Optimizer** | AdamW |
+| **Optimizer** | AdamW (fused) |
 | **Learning rate** | 6e-4 peak, cosine decay to 0 |
 | **Warmup** | 700 steps (~350M tokens) |
 | **Weight decay** | 0.1 (on 2D weight tensors only) |
 | **Beta1 / Beta2** | 0.9 / 0.95 |
 | **Gradient clipping** | 1.0 (max norm) |
 | **Batch size** | 524,288 tokens per update (micro-batch × grad accum × seq_len) |
-| **Total steps** | ~19,073 (one epoch over 10B tokens) |
+| **Total steps** | 19,073 (one epoch over 10B tokens) |
 | **Precision** | bfloat16 |
 | **Seed** | 42 |
 
@@ -153,159 +204,86 @@ ds = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train"
 
 HuggingFace dataset ID: `HuggingFaceFW/fineweb-edu`, subset `sample-10BT`. Fields: `text`, `id`, `score` (educational quality 0-5).
 
+Data is tokenized into 100 binary shards (~100M tokens each) + 1 validation shard, stored in `data/tokenized/` as uint16 `.bin` files.
+
 ### Hardware
 
-- **Training GPU:** NVIDIA RTX 5090 (32 GB GDDR7, ~209 BF16 TFLOPS, 1,792 GB/s bandwidth)
-- **Expected throughput:** ~150,000-180,000 tokens/sec for 125M model
-- **Expected training time:** ~4 hours per model for 2.5B tokens, ~15-16 hours for full 10B tokens
-- **Note:** Use `torch.compile` for optimal performance. Flash Attention should work on RTX 5090 (SM 10.0 / Blackwell consumer).
+- **Baseline training:** NVIDIA RTX 5090 (32 GB GDDR7), ~141K tok/s, ~19.7 hours
+- **CoFrGeNet-F training:** NVIDIA H200 (80 GB HBM3e) via Docker, ~74K tok/s
+- **Docker image:** `pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel` (see `Dockerfile`)
+- **Container:** `cofrgenet-train` — currently running CoFrGeNet-F training
 
 ## Project Structure
 
 ```
 cofrgenet-f/
-├── CLAUDE.md              # This file — all context for implementation
-├── README.md              # Public-facing project README
-├── pyproject.toml         # Package config
-├── requirements.txt       # Pinned dependencies
+├── CLAUDE.md                  # This file — all context for implementation
+├── README.md                  # Public-facing project README
+├── Dockerfile                 # PyTorch base image for training
+├── docker-compose.yml         # Docker compose for training
+├── pyproject.toml             # Package config
+├── requirements.txt           # Pinned dependencies
 ├── src/
 │   ├── cofrgenet/
 │   │   ├── __init__.py
-│   │   ├── model.py       # CoFrGeNet-F model (Cffn + standard attention)
-│   │   ├── cffn.py        # Continued Fraction FFN layer
-│   │   ├── continuant.py  # Continuant computation + custom backward
-│   │   └── config.py      # Model config dataclass
+│   │   ├── model.py           # CoFrGeNet-F model (Cffn + standard attention)
+│   │   ├── cffn.py            # Continued Fraction FFN layer (p-variate, gated)
+│   │   ├── continuant.py      # Continuant computation + custom backward
+│   │   └── config.py          # CoFrGeNetConfig dataclass
 │   └── baseline/
 │       ├── __init__.py
-│       ├── model.py       # Standard GPT-2 Small transformer
-│       └── config.py      # Baseline config dataclass
+│       ├── model.py           # Standard GPT-2 Small (also houses shared TransformerBlock, CausalSelfAttention)
+│       └── config.py          # BaselineConfig dataclass
 ├── scripts/
 │   ├── 01_download_data.py    # Download & tokenize FineWeb-Edu 10BT
 │   ├── 02_train_baseline.py   # Train standard transformer
 │   ├── 03_train_cofrgenet.py  # Train CoFrGeNet-F (with dyadic schedule)
-│   ├── 04_evaluate.py         # Eval both models on benchmarks
-│   └── 05_generate_examples.py # Generate text samples for comparison
+│   ├── train_common.py        # Shared: DataLoader, LR schedule, training loop, checkpointing
+│   ├── 04_evaluate.py         # NOT YET IMPLEMENTED — eval both models on benchmarks
+│   └── 05_generate_examples.py # NOT YET IMPLEMENTED — text generation comparison
 ├── configs/
 │   ├── baseline.yaml
 │   └── cofrgenet_f.yaml
 ├── tests/
 │   ├── __init__.py
-│   ├── test_continuant.py     # Unit tests for continuant math
-│   ├── test_cffn.py           # Unit tests for Cffn layer
-│   ├── test_model.py          # Integration tests for full model
-│   └── test_training.py       # Smoke test for training loop
+│   ├── test_continuant.py     # Continuant math: base cases, naive recursion, gradients, finite-diff, pole avoidance
+│   ├── test_cffn.py           # Cffn: shapes, param counts, gradients, depth freezing, gating
+│   ├── test_model.py          # Full model: forward shapes, param counts, causal masking, generation, dyadic schedule
+│   └── test_training.py       # Smoke test: DataLoader, LR schedule, 10-step training
 ├── demo/
-│   └── app.py                 # Gradio demo (side-by-side generation)
+│   └── app.py                 # NOT YET IMPLEMENTED — Gradio demo
 ├── docs/
-│   └── plans/
-│       └── 2026-03-01-cofrgenet-f-implementation.md
+│   ├── plans/
+│   │   └── 2026-03-01-cofrgenet-f-implementation.md
+│   └── H200_TRAINING_GUIDE.md # Guide for remote H200 training setup
+├── checkpoints/               # .gitignored except HuggingFace release files
+│   ├── baseline/              # Final baseline model + eval_results.json + HF README
+│   └── cofrgenet/             # Step checkpoints (every 1K steps) + optimizer state
 └── data/                      # .gitignored — created at runtime
-    ├── raw/                   # Downloaded FineWeb-Edu parquet
-    └── tokenized/             # Tokenized binary shards
+    └── tokenized/             # 100 train shards + 1 val shard (uint16 .bin)
 ```
 
-## Implementation Priorities
+### Key Code Architecture Decisions
 
-1. **Continuant computation first** (`src/cofrgenet/continuant.py`) — this is the mathematical core. Implement forward + custom backward with the gradient formula from Proposition 1. Write thorough unit tests comparing against naive recursive computation.
-
-2. **Cffn layer** (`src/cofrgenet/cffn.py`) — ensemble of L ladders with direct linear path. Test parameter counts match expected formulas.
-
-3. **Full CoFrGeNet-F model** (`src/cofrgenet/model.py`) — standard Transformer with Cffn replacing FFN. Should be a drop-in replacement — the model is identical to baseline except for the FFN.
-
-4. **Baseline Transformer** (`src/baseline/model.py`) — clean GPT-2 Small implementation. Keep it simple, nanoGPT-style.
-
-5. **Data pipeline** — download FineWeb-Edu 10BT, tokenize with GPT-2 tokenizer, shard into binary files.
-
-6. **Training scripts** — train both models with identical hyperparameters. The only difference: CoFrGeNet-F uses the dyadic schedule for Cffn parameters.
-
-7. **Evaluation** — perplexity on WikiText-2, WikiText-103, LAMBADA. Parameter count comparison. Throughput comparison (tokens/sec).
-
-8. **Demo + release** — Gradio app, HuggingFace model upload, blog post.
-
-## Key Implementation Details
-
-### Custom Autograd for Continuants
-
-Do NOT rely on PyTorch autograd for the continued fraction computation. The paper explicitly derives custom gradients because:
-- Naive autograd requires d divisions (numerically unstable)
-- Custom backward uses only 1 division (the `1/K_d` term)
-
-Use `torch.autograd.Function` with a custom `backward()` method.
-
-### The Cffn Forward Pass
-
-```python
-# Pseudocode for Cffn forward
-def forward(self, x):
-    # x: (batch, seq_len, p)
-
-    # Direct linear path
-    linear_out = self.U(x)  # (batch, seq_len, p)
-
-    # Continued fraction ladders
-    ladder_outputs = []
-    for j in range(self.L):
-        a = self.W[j](x)  # (batch, seq_len, d+1)
-        z_j = continued_fraction(a)  # (batch, seq_len, 1) — the f̃ value
-        ladder_outputs.append(z_j)
-
-    z = torch.cat(ladder_outputs, dim=-1)  # (batch, seq_len, L)
-    combined = self.V(z)  # (batch, seq_len, p)
-
-    return linear_out + combined
-```
-
-### Dyadic Schedule Implementation
-
-```python
-def get_unfrozen_depth(current_step, total_steps, max_depth):
-    """Return the maximum depth that should be unfrozen at current_step."""
-    for d in range(max_depth, 0, -1):
-        unfreeze_at = total_steps * (1 - 1 / (2 ** d))
-        if current_step >= unfreeze_at:
-            return d
-    return 0  # only linear component
-```
-
-Freeze/unfreeze Cffn parameters each step based on this schedule.
-
-### Shared Components
-
-Both models should share:
-- Token + positional embeddings
-- Layer norm
-- Attention implementation
-- Training loop
-- Data loading
-
-Only the FFN differs. Factor the code so the Transformer block takes the FFN as a parameter.
-
-## Dependencies
-
-Core:
-- `torch` (2.5+, with CUDA support for RTX 5090)
-- `tiktoken` (GPT-2 tokenizer)
-- `datasets` (HuggingFace, for FineWeb-Edu streaming)
-- `safetensors` (model saving)
-- `wandb` (training logging)
-- `gradio` (demo)
-
-Testing:
-- `pytest`
+- **`TransformerBlock` takes FFN as a parameter**: Both models reuse the same `TransformerBlock(config, ffn_module)` class from `src/baseline/model.py`. The CoFrGeNet-F model imports `TransformerBlock` and `CausalSelfAttention` from the baseline module.
+- **Custom autograd**: `ContinuedFractionFunction` in `continuant.py` uses `torch.autograd.Function` — do NOT rely on PyTorch autograd for the continued fraction. Proposition 1 gradients use only 1 division.
+- **Dyadic schedule via gradient hooks**: `Cffn.set_active_depth()` installs `register_hook` callbacks on ladder weights that zero out gradients for frozen depth columns. The `make_hook(max_active)` closure captures the active depth correctly.
+- **Checkpointing**: Uses `safetensors.torch.save_model` (not `save_file`) for model weights, separate `.pt` files for optimizer state.
+- **Weight tying**: Both models tie `lm_head.weight = tok_emb.weight`.
 
 ## Evaluation Benchmarks
 
 After training, evaluate both models on:
 
-| Benchmark | Metric | How |
-|-----------|--------|-----|
-| WikiText-2 | Perplexity | Stride-512 evaluation |
-| WikiText-103 | Perplexity | Stride-512 evaluation |
-| LAMBADA | Perplexity + Accuracy | Last-word prediction |
-| HellaSwag | Accuracy | Zero-shot, multiple choice |
-| Parameter count | Total params | `sum(p.numel() for p in model.parameters())` |
-| Throughput | Tokens/sec | Measure during training |
-| Inference speed | ms/token | Measure during generation |
+| Benchmark | Metric | How | Baseline Result |
+|-----------|--------|-----|-----------------|
+| WikiText-2 | Perplexity | Stride-512 evaluation | 34.13 |
+| WikiText-103 | Perplexity | Stride-512 evaluation | 34.13 |
+| LAMBADA | Perplexity + Accuracy | Last-word prediction | 37.47 / 19.15% |
+| HellaSwag | Accuracy | Zero-shot, multiple choice | Not yet evaluated |
+| Parameter count | Total params | `sum(p.numel() for p in model.parameters())` | 124,337,664 |
+| Throughput | Tokens/sec | Measure during training | 141K (5090) |
+| Inference speed | ms/token | Measure during generation | 1.41 |
 
 ## Reference Links
 
@@ -316,6 +294,7 @@ After training, evaluate both models on:
 - **FineWeb-Edu dataset:** https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu
 - **nanoGPT (reference implementation):** https://github.com/karpathy/nanoGPT
 - **llm.c GPT-2 reproduction:** https://github.com/karpathy/llm.c/discussions/481
+- **Project Wiki:** https://github.com/cahlen/cofrgenet-f/wiki
 
 ## IBM Patent Note
 
