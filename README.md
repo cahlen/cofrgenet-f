@@ -130,7 +130,7 @@ By caching the reciprocal of the final continuant and reusing it across all dept
 Continued fractions can encounter poles when the denominator vanishes. We apply safe clamping:
 
 $$
-K_d^{\text{safe}} = \operatorname{sign}(K_d) \cdot \max\!\left( |K_d|, \; \epsilon \right), \qquad \epsilon = 0.01
+K_d^{\text{safe}} = \text{sign}(K_d) \cdot \max\!\left( |K_d|, \; \epsilon \right), \qquad \epsilon = 0.01
 $$
 
 ### Parameter Count per Cffn Layer
