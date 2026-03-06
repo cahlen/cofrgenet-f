@@ -59,11 +59,11 @@ All models are trained on [FineWeb-Edu 10BT](https://huggingface.co/datasets/Hug
 | **Baseline** | 12L, 768d, 12h, standard FFN | 124.3M |
 | **CoFrGeNet-F** | 12L, 1024d, 16h, Cffn (L=3, d=5) | 128.3M |
 
-By widening the hidden dimension from 768 to 1024, the CoFrGeNet-F model reaches ~128M parameters — matching the baseline. This isolates the architectural question: at equal parameter count, which FFN design produces better language modeling? Training is in progress on H200.
+By widening the hidden dimension from 768 to 1024, the CoFrGeNet-F model reaches ~128M parameters — matching the baseline. This isolates the architectural question: at equal parameter count, which FFN design produces better language modeling? Training is in progress on H200 with `torch.compile` (~105K tok/s).
 
 ### HuggingFace
 
-Both model weights from Experiment 1 are available on HuggingFace: [cahlen/cofrgenet-f-82m](https://huggingface.co/cahlen/cofrgenet-f-82m). Experiment 2 results will be added upon completion.
+Both model weights from Experiment 1 are on HuggingFace: [cahlen/cofrgenet-f-82m](https://huggingface.co/cahlen/cofrgenet-f-82m). Experiment 2 results will be added upon completion.
 
 ## Project Status
 
@@ -197,6 +197,7 @@ docker run --gpus all \
 | Batch size | 524,288 tokens per update |
 | Total steps | 19,073 (one epoch) |
 | Precision | bfloat16 |
+| torch.compile | Used for 128M experiment (~2.3x throughput) |
 
 CoFrGeNet-F additionally uses a **dyadic training schedule** that progressively unfreezes continued fraction depth levels — without this, the paper reports 10–80% performance degradation:
 

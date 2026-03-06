@@ -67,7 +67,7 @@ Evaluated on same H200 with identical code (`scripts/04_evaluate.py`).
 | Baseline | 12L, 768d, 12h, standard FFN | 124,337,664 |
 | CoFrGeNet-F | 12L, 1024d, 16h, L=3 ladders, d=5 depth | 128,256,000 |
 
-**Status:** Training on H200 GPU 2, container `cofrgenet-128m`, ~43K tok/s, ETA ~65 hours.
+**Status:** Training on H200 GPU 2, container `cofrgenet-128m`, ~105K tok/s (with `torch.compile`), ETA ~26 hours.
 **Checkpoints:** `checkpoints/cofrgenet-128m/` (every 1K steps)
 
 ## Architecture Overview
@@ -156,24 +156,27 @@ All models trained with identical hyperparameters on the same data.
 | **Batch size** | 524,288 tokens per update |
 | **Total steps** | 19,073 (one epoch over 10B tokens) |
 | **Precision** | bfloat16 |
+| **torch.compile** | Used for 128M experiment (~2.3x throughput boost) |
 | **Seed** | 42 |
 
 ### Hardware
 - **Baseline training:** NVIDIA RTX 5090 (32 GB), ~141K tok/s, ~19.7 hours
 - **CoFrGeNet-F 82M:** H200 GPU 0, container `cofrgenet-train`, ~74K tok/s, ~37.3 hours
-- **CoFrGeNet-F 128M:** H200 GPU 2, container `cofrgenet-128m`, ~43K tok/s, ~65 hours (est.)
+- **CoFrGeNet-F 128M:** H200 GPU 2, container `cofrgenet-128m`, ~105K tok/s (with `torch.compile`), ~26 hours (est.)
 - **Docker image:** `pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel`
 
 ### Running the 128M Experiment
 
 ```bash
-docker exec -d -e CUDA_VISIBLE_DEVICES=2 cofrgenet-128m python3 scripts/03_train_cofrgenet.py \
-  --n_embd 1024 --n_head 16 \
-  --checkpoint_dir checkpoints/cofrgenet-128m \
-  --no_wandb
+docker run -d --name cofrgenet-128m \
+  --gpus '"device=2"' \
+  -e PYTHONPATH=/workspace -e PYTHONUNBUFFERED=1 \
+  -v "$(pwd)":/workspace -v "$(pwd)"/data:/workspace/data -v "$(pwd)"/checkpoints:/workspace/checkpoints \
+  pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel \
+  bash -c "pip install tiktoken safetensors datasets > /dev/null 2>&1 && python3 scripts/03_train_cofrgenet.py --n_embd 1024 --n_head 16 --checkpoint_dir checkpoints/cofrgenet-128m --no_wandb --compile"
 ```
 
-Check progress: `ls checkpoints/cofrgenet-128m/` (new checkpoint every ~6.5 hours)
+Check progress: `docker logs cofrgenet-128m --tail 10` (new checkpoint every ~2.6 hours)
 
 ## Project Structure
 
