@@ -26,24 +26,21 @@ $$
 
 This replaces the standard 2-layer FFN (Linear → GELU → Linear) with a **rational function** that is strictly more expressive per parameter. Rational functions approximate a broader class of functions than polynomials with the same parameter count — achieving **~4× fewer parameters per FFN layer**.
 
-## Models
+## Experiments
 
-Two models trained on [FineWeb-Edu 10BT](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu) (~10 billion tokens) with identical hyperparameters. The only difference is the FFN architecture:
+All models are trained on [FineWeb-Edu 10BT](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu) (~10 billion tokens) with identical hyperparameters and the same dyadic training schedule. All evaluations use the same code on the same hardware.
 
-| Model | Parameters | FFN Type | FFN Params/Layer |
-|-------|-----------|----------|-----------------|
-| **Baseline** (GPT-2 Small) | 124.3M | Standard (Linear → GELU → Linear) | 4,718,592 |
-| **CoFrGeNet-F** | 82.0M (34% fewer) | Continued Fraction FFN (Cffn) | 1,193,472 |
+### Experiment 1: Parameter-Efficient (82M vs 124M)
 
-Both models: 12 layers, 12 attention heads, 768 hidden dim, 1024 context length, GPT-2 tokenizer (50,257 vocab).
+**Question:** Can CoFrGeNet-F match baseline quality with 34% fewer parameters?
 
-### Head-to-Head Results
-
-Both models evaluated on the same NVIDIA H200 with identical evaluation code.
+| Model | Config | Parameters |
+|-------|--------|-----------|
+| **Baseline** | 12L, 768d, 12h, standard FFN | 124.3M |
+| **CoFrGeNet-F** | 12L, 768d, 12h, Cffn (L=3, d=5) | 82.0M (34% fewer) |
 
 | Metric | Baseline (124M) | CoFrGeNet-F (82M) | Note |
 |--------|-----------------|-------------------|------|
-| Parameters | 124,337,664 | **82,036,224** | 34.0% fewer |
 | WikiText-2 PPL | **40.79** | 110.32 | lower is better |
 | WikiText-103 PPL | **40.79** | 110.32 | lower is better |
 | LAMBADA PPL | **37.45** | 166.57 | lower is better |
@@ -51,11 +48,22 @@ Both models evaluated on the same NVIDIA H200 with identical evaluation code.
 | Throughput | **277,827** tok/s | 103,455 tok/s | |
 | Generation Speed | **5.53** ms/tok | 10.92 ms/tok | |
 
-At GPT-2 Small scale, CoFrGeNet-F does not yet match the standard Transformer baseline. The paper's strongest results were at GPT-2 XL scale (985M params), where CoFrGeNet-F beat the full 1.5B GPT2-xl on all benchmarks. The architecture likely requires larger scale or longer training to realize its advantages.
+**Result:** At GPT-2 Small scale, CoFrGeNet-F does not match the baseline with fewer parameters. The paper's strongest results were at GPT-2 XL scale (985M CoFrGeNet-F vs 1.5B baseline), suggesting the architecture benefits from larger scale.
+
+### Experiment 2: Iso-Parameter (128M vs 124M) — In Progress
+
+**Question:** With equal parameter budget, does CoFrGeNet-F match or beat the baseline?
+
+| Model | Config | Parameters |
+|-------|--------|-----------|
+| **Baseline** | 12L, 768d, 12h, standard FFN | 124.3M |
+| **CoFrGeNet-F** | 12L, 1024d, 16h, Cffn (L=3, d=5) | 128.3M |
+
+By widening the hidden dimension from 768 to 1024, the CoFrGeNet-F model reaches ~128M parameters — matching the baseline. This isolates the architectural question: at equal parameter count, which FFN design produces better language modeling? Training is in progress on H200.
 
 ### HuggingFace
 
-Both model weights are available on HuggingFace: [cahlen/cofrgenet-f-82m](https://huggingface.co/cahlen/cofrgenet-f-82m)
+Both model weights from Experiment 1 are available on HuggingFace: [cahlen/cofrgenet-f-82m](https://huggingface.co/cahlen/cofrgenet-f-82m). Experiment 2 results will be added upon completion.
 
 ## Project Status
 
@@ -64,9 +72,10 @@ Both model weights are available on HuggingFace: [cahlen/cofrgenet-f-82m](https:
 - [x] Data pipeline (FineWeb-Edu 10BT tokenized to binary shards)
 - [x] Training infrastructure (shared training loop, dyadic schedule)
 - [x] Baseline model trained and evaluated
-- [x] CoFrGeNet-F model trained and evaluated
+- [x] Experiment 1: CoFrGeNet-F 82M trained and evaluated
 - [x] Head-to-head benchmark comparison
-- [x] Both models released on HuggingFace
+- [x] Both Experiment 1 models released on HuggingFace
+- [ ] **Experiment 2: CoFrGeNet-F 128M (training in progress)**
 - [ ] Interactive Gradio demo (side-by-side generation)
 - [ ] Technical write-up / blog post
 
