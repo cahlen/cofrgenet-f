@@ -50,7 +50,7 @@ All models are trained on [FineWeb-Edu 10BT](https://huggingface.co/datasets/Hug
 
 **Result:** At GPT-2 Small scale, CoFrGeNet-F does not match the baseline with fewer parameters. The paper's strongest results were at GPT-2 XL scale (985M CoFrGeNet-F vs 1.5B baseline), suggesting the architecture benefits from larger scale.
 
-### Experiment 2: Iso-Parameter (128M vs 124M) — In Progress
+### Experiment 2: Iso-Parameter (128M vs 124M) — Complete
 
 **Question:** With equal parameter budget, does CoFrGeNet-F match or beat the baseline?
 
@@ -59,11 +59,24 @@ All models are trained on [FineWeb-Edu 10BT](https://huggingface.co/datasets/Hug
 | **Baseline** | 12L, 768d, 12h, standard FFN | 124.3M |
 | **CoFrGeNet-F** | 12L, 1024d, 16h, Cffn (L=3, d=5) | 128.3M |
 
-By widening the hidden dimension from 768 to 1024, the CoFrGeNet-F model reaches ~128M parameters — matching the baseline. This isolates the architectural question: at equal parameter count, which FFN design produces better language modeling? Training is in progress on H200 with `torch.compile` (~105K tok/s).
+By widening the hidden dimension from 768 to 1024, the CoFrGeNet-F model reaches ~128M parameters — matching the baseline. This isolates the architectural question: at equal parameter count, which FFN design produces better language modeling?
+
+**Result:** Significant improvement over Experiment 1, but baseline still wins.
+
+| Metric | Baseline (124M) | CoFrGeNet-F (128M) | |
+|--------|:---------------:|:-----------------:|---|
+| WikiText-2 PPL | **40.79** | 82.46 | lower is better |
+| WikiText-103 PPL | **40.79** | 82.46 | lower is better |
+| LAMBADA PPL | **37.45** | 111.26 | lower is better |
+| LAMBADA Acc | **19.06%** | 11.41% | higher is better |
+| Throughput | **452,622** tok/s | 128,206 tok/s | |
+| Gen Speed | **3.68** ms/tok | 10.50 ms/tok | |
+
+Trained on H200 with `torch.compile` (~114K tok/s, 24.3 hours). The improvement from 82M→128M (WikiText-2 PPL 110→82) suggests the architecture benefits from scale, consistent with the paper's strongest results at GPT-2 XL scale (985M params).
 
 ### HuggingFace
 
-Both model weights from Experiment 1 are on HuggingFace: [cahlen/cofrgenet-f-82m](https://huggingface.co/cahlen/cofrgenet-f-82m). Experiment 2 results will be added upon completion.
+Model weights are on HuggingFace: [cahlen/cofrgenet-f-82m](https://huggingface.co/cahlen/cofrgenet-f-82m).
 
 ## Project Status
 
@@ -75,7 +88,7 @@ Both model weights from Experiment 1 are on HuggingFace: [cahlen/cofrgenet-f-82m
 - [x] Experiment 1: CoFrGeNet-F 82M trained and evaluated
 - [x] Head-to-head benchmark comparison
 - [x] Both Experiment 1 models released on HuggingFace
-- [ ] **Experiment 2: CoFrGeNet-F 128M (training in progress)**
+- [x] Experiment 2: CoFrGeNet-F 128M trained and evaluated
 - [ ] Interactive Gradio demo (side-by-side generation)
 - [ ] Technical write-up / blog post
 

@@ -15,19 +15,15 @@ An open-source implementation of CoFrGeNet-F, a continued fraction architecture 
 - **Baseline model (124M)**: Fully trained (19,073 steps on RTX 5090, ~19.7 hours, ~141K tok/s)
 - **CoFrGeNet-F 82M (Experiment 1)**: Fully trained (19,073 steps on H200, ~37.3 hours, ~74K tok/s)
 - **Evaluation script**: `scripts/04_evaluate.py` — WikiText-2, WikiText-103, LAMBADA, throughput, generation speed
-- **Both models evaluated**: Head-to-head on same H200, same code (see Results below)
+- **All models evaluated**: Head-to-head on same H200, same code (see Results below)
+- **CoFrGeNet-F 128M (Experiment 2)**: Fully trained (19,073 steps on H200, ~24.3 hours, ~114K tok/s with `torch.compile`)
 - **HuggingFace repo**: Public at [`cahlen/cofrgenet-f-82m`](https://huggingface.co/cahlen/cofrgenet-f-82m) with both model weights + eval results
 - **GitHub Wiki**: 7 pages of detailed architecture + math documentation
 
-### In Progress
-- **CoFrGeNet-F 128M (Experiment 2)**: Running on H200 GPU 2 via Docker container `cofrgenet-128m`. Config: 12L, 1024d, 16h, L=3, d=5. ~43K tok/s. ETA ~65 hours.
-
 ### Remaining
-- Evaluate CoFrGeNet-F 128M and add to comparison
 - Update HuggingFace repo with 128M results
 - `scripts/05_generate_examples.py` — text generation comparison
 - `demo/app.py` — Gradio demo (side-by-side generation)
-- Make GitHub repo and HuggingFace repo public
 - Blog post / technical write-up
 
 ## Experiments
@@ -58,7 +54,7 @@ The paper's strongest results were at GPT-2 XL scale (985M CoFrGeNet-F vs 1.5B b
 
 Evaluated on same H200 with identical code (`scripts/04_evaluate.py`).
 
-### Experiment 2: Iso-Parameter (128M vs 124M) — IN PROGRESS
+### Experiment 2: Iso-Parameter (128M vs 124M) — COMPLETE
 
 **Question:** With equal parameter budget, does CoFrGeNet-F match or beat the baseline?
 
@@ -67,8 +63,19 @@ Evaluated on same H200 with identical code (`scripts/04_evaluate.py`).
 | Baseline | 12L, 768d, 12h, standard FFN | 124,337,664 |
 | CoFrGeNet-F | 12L, 1024d, 16h, L=3 ladders, d=5 depth | 128,256,000 |
 
-**Status:** Training on H200 GPU 2, container `cofrgenet-128m`, ~105K tok/s (with `torch.compile`), ETA ~26 hours.
-**Checkpoints:** `checkpoints/cofrgenet-128m/` (every 1K steps)
+**Result:** CoFrGeNet-F improves significantly over Experiment 1 but still underperforms the baseline.
+
+| Metric | Baseline (124M) | CoFrGeNet-F (128M) |
+|--------|-----------------|-------------------|
+| WikiText-2 PPL | **40.79** | 82.46 |
+| WikiText-103 PPL | **40.79** | 82.46 |
+| LAMBADA PPL | **37.45** | 111.26 |
+| LAMBADA Acc | **19.06%** | 11.41% |
+| Throughput | **452,622** tok/s | 128,206 tok/s |
+| Gen Speed | **3.68** ms/tok | 10.50 ms/tok |
+
+Trained on H200 GPU 2, ~114K tok/s with `torch.compile`, 24.3 hours.
+**Checkpoints:** `checkpoints/cofrgenet-128m/`
 
 ## Architecture Overview
 

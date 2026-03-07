@@ -31,17 +31,22 @@ from src.cofrgenet.config import CoFrGeNetConfig
 from src.cofrgenet.model import CoFrGeNetTransformer
 
 
-def load_model(model_type, checkpoint_path, device):
+def load_model(model_type, checkpoint_path, device, config_overrides=None):
     """Load a model from a safetensors checkpoint."""
+    config_overrides = config_overrides or {}
     if model_type == "baseline":
-        config = BaselineConfig()
+        config = BaselineConfig(**config_overrides)
         model = BaselineTransformer(config)
     else:
-        config = CoFrGeNetConfig()
+        config = CoFrGeNetConfig(**config_overrides)
         model = CoFrGeNetTransformer(config)
 
     state_dict = load_file(checkpoint_path)
-    model.load_state_dict(state_dict, strict=False)  # lm_head tied to tok_emb
+    # torch.compile adds _orig_mod. prefix to keys — strip it if present
+    cleaned = {}
+    for k, v in state_dict.items():
+        cleaned[k.removeprefix("_orig_mod.")] = v
+    model.load_state_dict(cleaned, strict=False)  # lm_head tied to tok_emb
     model = model.to(device)
     model.eval()
 
@@ -222,14 +227,14 @@ def eval_generation_speed(model, block_size, device, num_tokens=200, num_runs=5)
     return ms_per_tok
 
 
-def evaluate_model(model_type, checkpoint_path, device):
+def evaluate_model(model_type, checkpoint_path, device, config_overrides=None):
     """Run all benchmarks on a single model."""
     print(f"\n{'='*60}")
     print(f"Evaluating: {model_type}")
     print(f"Checkpoint: {checkpoint_path}")
     print(f"{'='*60}")
 
-    model, config, total_params = load_model(model_type, checkpoint_path, device)
+    model, config, total_params = load_model(model_type, checkpoint_path, device, config_overrides)
     block_size = config.block_size
 
     results = {
@@ -316,7 +321,19 @@ def main():
                         default="checkpoints/baseline/model.safetensors")
     parser.add_argument("--cofrgenet_checkpoint", type=str,
                         default="checkpoints/cofrgenet/final.safetensors")
+    # Config overrides for non-default model dimensions
+    parser.add_argument("--n_embd", type=int, default=None)
+    parser.add_argument("--n_head", type=int, default=None)
+    parser.add_argument("--n_layer", type=int, default=None)
     args = parser.parse_args()
+
+    config_overrides = {}
+    if args.n_embd is not None:
+        config_overrides["n_embd"] = args.n_embd
+    if args.n_head is not None:
+        config_overrides["n_head"] = args.n_head
+    if args.n_layer is not None:
+        config_overrides["n_layer"] = args.n_layer
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
@@ -325,14 +342,14 @@ def main():
 
     if args.model == "both":
         baseline_results = evaluate_model("baseline", args.baseline_checkpoint, device)
-        cofrgenet_results = evaluate_model("cofrgenet", args.cofrgenet_checkpoint, device)
+        cofrgenet_results = evaluate_model("cofrgenet", args.cofrgenet_checkpoint, device, config_overrides)
         print_comparison(baseline_results, cofrgenet_results)
     elif args.model == "baseline":
         ckpt = args.checkpoint or args.baseline_checkpoint
-        evaluate_model("baseline", ckpt, device)
+        evaluate_model("baseline", ckpt, device, config_overrides)
     else:
         ckpt = args.checkpoint or args.cofrgenet_checkpoint
-        evaluate_model("cofrgenet", ckpt, device)
+        evaluate_model("cofrgenet", ckpt, device, config_overrides)
 
 
 if __name__ == "__main__":
