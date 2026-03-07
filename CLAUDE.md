@@ -20,8 +20,11 @@ An open-source implementation of CoFrGeNet-F, a continued fraction architecture 
 - **HuggingFace repo**: Public at [`cahlen/cofrgenet-f`](https://huggingface.co/cahlen/cofrgenet-f) with both model weights + eval results
 - **GitHub Wiki**: 7 pages of detailed architecture + math documentation
 
+### In Progress
+- **CoFrGeNet-F 128M L=8 (Experiment 3)**: Training on H200 GPU 2, container `cofrgenet-L8`. ETA ~March 10.
+
 ### Remaining
-- Update HuggingFace repo with 128M results
+- Evaluate Experiment 3 and add to comparison
 - `scripts/05_generate_examples.py` — text generation comparison
 - `demo/app.py` — Gradio demo (side-by-side generation)
 - Blog post / technical write-up
@@ -30,7 +33,7 @@ An open-source implementation of CoFrGeNet-F, a continued fraction architecture 
 
 ### Why Multiple Experiments?
 
-The paper's strongest results were at GPT-2 XL scale (985M CoFrGeNet-F vs 1.5B baseline). Our Experiment 1 at 82M (34% fewer params than baseline) showed CoFrGeNet-F underperforming. Experiment 2 tests whether matching the baseline's parameter count closes the gap — an **iso-parameter comparison** that isolates the architectural difference.
+The paper's strongest results were at GPT-2 XL scale (985M CoFrGeNet-F vs 1.5B baseline). Our Experiment 1 at 82M (34% fewer params than baseline) showed CoFrGeNet-F underperforming. Experiment 2 matched the baseline's parameter count and showed improvement. Experiment 3 tests whether more continued fraction ladders (L=8 vs L=3) further closes the gap — each ladder is an independent rational approximation, so more ladders give a richer function space at negligible parameter cost.
 
 ### Experiment 1: Parameter-Efficient (82M vs 124M)
 
@@ -76,6 +79,18 @@ Evaluated on same H200 with identical code (`scripts/04_evaluate.py`).
 
 Trained on H200 GPU 2, ~114K tok/s with `torch.compile`, 24.3 hours.
 **Checkpoints:** `checkpoints/cofrgenet-128m/`
+
+### Experiment 3: More Ladders (128M, L=8 vs L=3) — IN PROGRESS
+
+**Question:** Does increasing the number of continued fraction ladders from 3 to 8 improve quality? Each ladder is an independent rational approximation — more ladders = richer function space, at minimal parameter cost (+0.3%).
+
+| Model | Config | Params |
+|-------|--------|--------|
+| CoFrGeNet-F (Exp 2) | 12L, 1024d, 16h, L=3 ladders, d=5 depth | 128,256,000 |
+| CoFrGeNet-F (Exp 3) | 12L, 1024d, 16h, L=8 ladders, d=5 depth | 128,624,640 |
+
+**Status:** Training on H200 GPU 2, container `cofrgenet-L8`, ~54K tok/s (with `torch.compile`, micro_batch_size=8), ETA ~51 hours (~March 10 04:00 UTC).
+**Checkpoints:** `checkpoints/cofrgenet-128m-L8/` (every 1K steps)
 
 ## Architecture Overview
 

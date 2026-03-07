@@ -74,6 +74,19 @@ By widening the hidden dimension from 768 to 1024, the CoFrGeNet-F model reaches
 
 Trained on H200 with `torch.compile` (~114K tok/s, 24.3 hours). The improvement from 82M→128M (WikiText-2 PPL 110→82) suggests the architecture benefits from scale, consistent with the paper's strongest results at GPT-2 XL scale (985M params).
 
+### Experiment 3: More Ladders (128M, L=8) — In Progress
+
+**Question:** Does increasing from 3 to 8 continued fraction ladders improve quality?
+
+Each ladder is an independent rational approximation of the input. More ladders give a richer function space at negligible parameter cost (+0.3%). This tests whether the Cffn's expressiveness is limited by having too few ladders.
+
+| Model | Config | Parameters |
+|-------|--------|-----------|
+| **CoFrGeNet-F (Exp 2)** | 12L, 1024d, 16h, Cffn (L=3, d=5) | 128.3M |
+| **CoFrGeNet-F (Exp 3)** | 12L, 1024d, 16h, Cffn (L=8, d=5) | 128.6M |
+
+Training on H200, ETA ~March 10, 2026.
+
 ### HuggingFace
 
 Model weights are on HuggingFace: [cahlen/cofrgenet-f](https://huggingface.co/cahlen/cofrgenet-f).
@@ -87,8 +100,8 @@ Model weights are on HuggingFace: [cahlen/cofrgenet-f](https://huggingface.co/ca
 - [x] Baseline model trained and evaluated
 - [x] Experiment 1: CoFrGeNet-F 82M trained and evaluated
 - [x] Head-to-head benchmark comparison
-- [x] Both Experiment 1 models released on HuggingFace
 - [x] Experiment 2: CoFrGeNet-F 128M trained and evaluated
+- [ ] **Experiment 3: CoFrGeNet-F 128M L=8 (training in progress)**
 - [ ] Interactive Gradio demo (side-by-side generation)
 - [ ] Technical write-up / blog post
 
