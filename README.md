@@ -76,7 +76,7 @@ Trained on H200 with `torch.compile` (~114K tok/s, 24.3 hours). The improvement 
 
 ### HuggingFace
 
-Model weights are on HuggingFace: [cahlen/cofrgenet-f-82m](https://huggingface.co/cahlen/cofrgenet-f-82m).
+Model weights are on HuggingFace: [cahlen/cofrgenet-f](https://huggingface.co/cahlen/cofrgenet-f).
 
 ## Project Status
 

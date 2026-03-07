@@ -17,7 +17,7 @@ An open-source implementation of CoFrGeNet-F, a continued fraction architecture 
 - **Evaluation script**: `scripts/04_evaluate.py` — WikiText-2, WikiText-103, LAMBADA, throughput, generation speed
 - **All models evaluated**: Head-to-head on same H200, same code (see Results below)
 - **CoFrGeNet-F 128M (Experiment 2)**: Fully trained (19,073 steps on H200, ~24.3 hours, ~114K tok/s with `torch.compile`)
-- **HuggingFace repo**: Public at [`cahlen/cofrgenet-f-82m`](https://huggingface.co/cahlen/cofrgenet-f-82m) with both model weights + eval results
+- **HuggingFace repo**: Public at [`cahlen/cofrgenet-f`](https://huggingface.co/cahlen/cofrgenet-f) with both model weights + eval results
 - **GitHub Wiki**: 7 pages of detailed architecture + math documentation
 
 ### Remaining
@@ -246,7 +246,7 @@ cofrgenet-f/
 
 ## HuggingFace
 
-- **Repo:** [`cahlen/cofrgenet-f-82m`](https://huggingface.co/cahlen/cofrgenet-f-82m) (public)
+- **Repo:** [`cahlen/cofrgenet-f`](https://huggingface.co/cahlen/cofrgenet-f) (public)
 - **Structure:** `cofrgenet/model.safetensors`, `baseline/model.safetensors`, `src/`, eval results
 - **Model card:** LaTeX math, head-to-head comparison table, full architecture docs
 - **Note:** HuggingFace does NOT support inline `$...$` math — only `$$` display blocks. GitHub supports both.
