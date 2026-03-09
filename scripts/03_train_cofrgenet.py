@@ -13,7 +13,8 @@ import numpy as np
 from src.cofrgenet.config import CoFrGeNetConfig
 from src.cofrgenet.model import CoFrGeNetTransformer, get_unfrozen_depth
 from scripts.train_common import (
-    ShardedDataLoader, configure_optimizer, train_loop, add_training_args
+    ShardedDataLoader, configure_optimizer, train_loop, add_training_args,
+    resume_from_checkpoint
 )
 
 
@@ -60,10 +61,6 @@ def main():
     print(f"CoFrGeNet-F Transformer: {total_params:,} parameters")
     print(f"Cffn config: L={config.num_ladders} ladders, d={config.cf_depth} depth")
 
-    if args.compile:
-        print("Compiling model with torch.compile...")
-        model = torch.compile(model)
-
     # Data
     grad_accum_steps = args.batch_tokens // (args.micro_batch_size * args.block_size)
     print(f"Gradient accumulation steps: {grad_accum_steps}")
@@ -104,6 +101,15 @@ def main():
         except Exception as e:
             print(f"wandb init failed: {e}, continuing without logging")
 
+    # Resume from checkpoint if requested (must happen before torch.compile)
+    resume_step = 0
+    if args.resume:
+        resume_step = resume_from_checkpoint(model, optimizer, args.checkpoint_dir, device)
+
+    if args.compile:
+        print("Compiling model with torch.compile...")
+        model = torch.compile(model)
+
     # Train
     train_loop(
         model=model,
@@ -122,6 +128,7 @@ def main():
         device=device,
         step_callback=dyadic_callback,
         wandb_run=wandb_run,
+        resume_step=resume_step,
     )
 
     if wandb_run is not None:

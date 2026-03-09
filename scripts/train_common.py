@@ -106,6 +106,43 @@ def save_checkpoint(model, optimizer, step, loss, path):
     torch.save({"optimizer": optimizer.state_dict(), "step": step, "loss": loss}, opt_path)
 
 
+def find_latest_checkpoint(checkpoint_dir):
+    """Find the latest checkpoint in a directory. Returns (step, safetensors_path) or None."""
+    if not os.path.exists(checkpoint_dir):
+        return None
+    checkpoints = sorted([
+        f for f in os.listdir(checkpoint_dir)
+        if f.startswith("step_") and f.endswith(".safetensors")
+    ])
+    if not checkpoints:
+        return None
+    latest = checkpoints[-1]
+    step = int(latest.split("_")[1].split(".")[0])
+    return step, os.path.join(checkpoint_dir, latest)
+
+
+def resume_from_checkpoint(model, optimizer, checkpoint_dir, device):
+    """Resume training from the latest checkpoint. Returns the step to resume from, or 0."""
+    result = find_latest_checkpoint(checkpoint_dir)
+    if result is None:
+        return 0
+    step, ckpt_path = result
+    opt_path = ckpt_path.replace(".safetensors", "_optim.pt")
+
+    print(f"Resuming from checkpoint: {ckpt_path} (step {step})")
+    state_dict = load_file(ckpt_path)
+    # Strip torch.compile _orig_mod. prefix if present
+    cleaned = {k.removeprefix("_orig_mod."): v for k, v in state_dict.items()}
+    model.load_state_dict(cleaned, strict=False)
+
+    if os.path.exists(opt_path):
+        opt_state = torch.load(opt_path, map_location=device, weights_only=False)
+        optimizer.load_state_dict(opt_state["optimizer"])
+        print(f"Restored optimizer state from step {step}")
+
+    return step
+
+
 def estimate_loss(model, data_loader, num_batches=20):
     """Estimate loss over num_batches."""
     model.eval()
@@ -137,6 +174,7 @@ def train_loop(
     device,
     step_callback=None,
     wandb_run=None,
+    resume_step=0,
 ):
     """Main training loop shared by both models.
 
@@ -144,14 +182,17 @@ def train_loop(
         step_callback: Optional fn(step, total_steps) called each step,
                        e.g., for dyadic schedule updates.
         wandb_run: Optional wandb run for logging.
+        resume_step: Step to resume training from (0 = start from scratch).
     """
     model.train()
 
-    step = 0
+    step = resume_step
     t0 = time.time()
     tokens_processed = 0
     batch_tokens = train_loader.batch_size * train_loader.block_size
 
+    if resume_step > 0:
+        print(f"Resuming training from step {resume_step}/{total_steps}")
     print(f"Starting training: {total_steps} steps, {grad_accum_steps} grad accum steps")
     print(f"Tokens per update: {batch_tokens * grad_accum_steps:,}")
 
@@ -258,4 +299,6 @@ def add_training_args(parser):
     parser.add_argument("--wandb_project", type=str, default="cofrgenet-f")
     parser.add_argument("--wandb_run_name", type=str, default=None)
     parser.add_argument("--no_wandb", action="store_true")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from latest checkpoint in checkpoint_dir")
     return parser
