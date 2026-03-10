@@ -99,10 +99,13 @@ def _checkpointed_forward(original_forward, *args, **kwargs):
 class ShardedDataLoader:
     """Loads tokenized binary shards with random sampling."""
 
-    def __init__(self, data_dir, split, block_size, batch_size, device="cpu"):
+    def __init__(self, data_dir, split, block_size, batch_size, device="cpu",
+                 rank=0, world_size=1):
         self.block_size = block_size
         self.batch_size = batch_size
         self.device = device
+        self.rank = rank
+        self.world_size = world_size
 
         pattern = f"{split}_"
         self.shards = sorted([
@@ -113,7 +116,8 @@ class ShardedDataLoader:
 
         self.current_shard_idx = 0
         self.current_data = None
-        self._load_shard(0)
+        start_shard = rank % len(self.shards)
+        self._load_shard(start_shard)
 
     def _load_shard(self, idx):
         self.current_shard_idx = idx % len(self.shards)
@@ -139,8 +143,8 @@ class ShardedDataLoader:
         return x, y
 
     def advance_shard(self):
-        """Move to the next shard (call after each epoch-ish)."""
-        self._load_shard(self.current_shard_idx + 1)
+        """Move to the next shard. In distributed mode, skip by world_size."""
+        self._load_shard(self.current_shard_idx + self.world_size)
 
 
 def get_lr(step, warmup_steps, total_steps, max_lr, min_lr=0.0):
