@@ -4,6 +4,7 @@ Usage:
     python scripts/03_train_cofrgenet.py
     python scripts/03_train_cofrgenet.py --max_steps 10 --eval_interval 5  # smoke test
     python scripts/03_train_cofrgenet.py --n_embd 1024 --n_head 16 --checkpoint_dir checkpoints/cofrgenet-128m
+    torchrun --nproc_per_node=2 scripts/03_train_cofrgenet.py  # multi-GPU FSDP
 """
 
 import argparse
@@ -14,7 +15,8 @@ from src.cofrgenet.config import CoFrGeNetConfig
 from src.cofrgenet.model import CoFrGeNetTransformer, get_unfrozen_depth
 from scripts.train_common import (
     ShardedDataLoader, configure_optimizer, train_loop, add_training_args,
-    resume_from_checkpoint
+    setup_distributed, cleanup_distributed, wrap_model_fsdp, is_distributed,
+    load_checkpoint_fsdp
 )
 
 
@@ -35,13 +37,17 @@ def main():
     if args.max_steps is not None:
         args.total_steps = args.max_steps
 
-    # Seed
+    # Distributed setup
+    rank, local_rank, world_size = setup_distributed()
+    device = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
+
+    # Per-rank seeding for data diversity
     torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    np.random.seed(args.seed + rank)
     torch.cuda.manual_seed_all(args.seed)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Device: {device}")
+    if rank == 0:
+        print(f"Device: {device}, World size: {world_size}")
 
     # Model — apply any dimension overrides
     config_kwargs = dict(block_size=args.block_size)
@@ -58,24 +64,43 @@ def main():
     config = CoFrGeNetConfig(**config_kwargs)
     model = CoFrGeNetTransformer(config).to(device)
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"CoFrGeNet-F Transformer: {total_params:,} parameters")
-    print(f"Cffn config: L={config.num_ladders} ladders, d={config.cf_depth} depth")
+    if rank == 0:
+        print(f"CoFrGeNet-F Transformer: {total_params:,} parameters")
+        print(f"Cffn config: L={config.num_ladders} ladders, d={config.cf_depth} depth")
+
+    # FSDP wrapping (before torch.compile and optimizer)
+    use_grad_ckpt = total_params > 5_000_000_000
+    if world_size > 1:
+        model = wrap_model_fsdp(model, device, use_gradient_checkpointing=use_grad_ckpt)
 
     # Data
     grad_accum_steps = args.batch_tokens // (args.micro_batch_size * args.block_size)
-    print(f"Gradient accumulation steps: {grad_accum_steps}")
+    if rank == 0:
+        print(f"Gradient accumulation steps: {grad_accum_steps}")
 
     train_loader = ShardedDataLoader(
-        args.data_dir, "train", args.block_size, args.micro_batch_size, device
+        args.data_dir, "train", args.block_size, args.micro_batch_size, device,
+        rank=rank, world_size=world_size
     )
     val_loader = ShardedDataLoader(
-        args.data_dir, "val", args.block_size, args.micro_batch_size, device
+        args.data_dir, "val", args.block_size, args.micro_batch_size, device,
+        rank=rank, world_size=world_size
     )
 
     # Optimizer
     optimizer = configure_optimizer(
         model, args.weight_decay, args.lr, (args.beta1, args.beta2), device
     )
+
+    # Resume from checkpoint if requested (must happen before torch.compile)
+    resume_step = 0
+    if args.resume:
+        resume_step = load_checkpoint_fsdp(model, optimizer, args.checkpoint_dir, device)
+
+    if args.compile:
+        if rank == 0:
+            print("Compiling model with torch.compile...")
+        model = torch.compile(model)
 
     # Dyadic schedule callback
     max_depth = config.cf_depth
@@ -84,13 +109,21 @@ def main():
     def dyadic_callback(step, total_steps):
         depth = get_unfrozen_depth(step, total_steps, max_depth)
         if depth != last_depth[0]:
-            print(f"  >>> Dyadic schedule: unfreezing depth {depth} at step {step}")
-            model.set_active_depth(depth)
+            if rank == 0:
+                print(f"  >>> Dyadic schedule: unfreezing depth {depth} at step {step}")
+            unwrapped = model.module if hasattr(model, 'module') else model
+            unwrapped = getattr(unwrapped, '_orig_mod', unwrapped)
+            unwrapped.set_active_depth(depth)
             last_depth[0] = depth
 
-    # Wandb
+    def grad_zero_callback():
+        unwrapped = model.module if hasattr(model, 'module') else model
+        unwrapped = getattr(unwrapped, '_orig_mod', unwrapped)
+        unwrapped.zero_frozen_grads()
+
+    # Wandb — only on rank 0
     wandb_run = None
-    if not args.no_wandb:
+    if rank == 0 and not args.no_wandb:
         try:
             import wandb
             wandb_run = wandb.init(
@@ -100,15 +133,6 @@ def main():
             )
         except Exception as e:
             print(f"wandb init failed: {e}, continuing without logging")
-
-    # Resume from checkpoint if requested (must happen before torch.compile)
-    resume_step = 0
-    if args.resume:
-        resume_step = resume_from_checkpoint(model, optimizer, args.checkpoint_dir, device)
-
-    if args.compile:
-        print("Compiling model with torch.compile...")
-        model = torch.compile(model)
 
     # Train
     train_loop(
@@ -129,10 +153,15 @@ def main():
         step_callback=dyadic_callback,
         wandb_run=wandb_run,
         resume_step=resume_step,
+        rank=rank,
+        world_size=world_size,
+        grad_zero_callback=grad_zero_callback,
     )
 
     if wandb_run is not None:
         wandb_run.finish()
+
+    cleanup_distributed()
 
 
 if __name__ == "__main__":
