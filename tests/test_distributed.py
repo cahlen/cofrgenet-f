@@ -78,3 +78,66 @@ class TestFSDPCheckpointing:
             optimizer2 = torch.optim.AdamW(model2.parameters(), lr=1e-3)
             step = load_checkpoint_fsdp(model2, optimizer2, tmpdir, device="cpu")
             assert step == 5
+
+
+from src.cofrgenet.config import CoFrGeNetConfig
+from src.cofrgenet.model import CoFrGeNetTransformer
+from src.baseline.config import BaselineConfig
+from src.baseline.model import BaselineTransformer
+from scripts.train_common import configure_optimizer, train_loop
+
+
+class TestSingleGPUTrainLoop:
+
+    @pytest.fixture
+    def tmp_data_dir(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rng = np.random.default_rng(42)
+            for name in ["train_000.bin", "val_000.bin"]:
+                tokens = rng.integers(0, 256, size=50000, dtype=np.uint16)
+                tokens.tofile(os.path.join(tmpdir, name))
+            yield tmpdir
+
+    def test_cofrgenet_train_loop_with_distributed_params(self, tmp_data_dir):
+        """Full train_loop with rank/world_size params should work single-GPU."""
+        device = "cpu"
+        cfg = CoFrGeNetConfig(
+            n_layer=2, n_head=2, n_embd=64, block_size=32, vocab_size=256,
+            num_ladders=2, cf_depth=3
+        )
+        model = CoFrGeNetTransformer(cfg).to(device)
+        optimizer = configure_optimizer(model, 0.1, 1e-3, (0.9, 0.95), device)
+        train_loader = ShardedDataLoader(tmp_data_dir, "train", 32, 4, device)
+        val_loader = ShardedDataLoader(tmp_data_dir, "val", 32, 4, device)
+
+        def grad_zero_cb():
+            model.zero_frozen_grads()
+
+        with tempfile.TemporaryDirectory() as ckpt_dir:
+            train_loop(
+                model=model, train_loader=train_loader, val_loader=val_loader,
+                optimizer=optimizer, total_steps=5, warmup_steps=2, max_lr=1e-3,
+                grad_accum_steps=1, grad_clip=1.0, save_interval=5, eval_interval=5,
+                checkpoint_dir=ckpt_dir, model_name="test", device=device,
+                rank=0, world_size=1, grad_zero_callback=grad_zero_cb,
+            )
+            assert os.path.exists(os.path.join(ckpt_dir, "final.safetensors"))
+
+    def test_baseline_train_loop_with_distributed_params(self, tmp_data_dir):
+        """Baseline train_loop with new params should work."""
+        device = "cpu"
+        cfg = BaselineConfig(n_layer=2, n_head=2, n_embd=64, block_size=32, vocab_size=256)
+        model = BaselineTransformer(cfg).to(device)
+        optimizer = configure_optimizer(model, 0.1, 1e-3, (0.9, 0.95), device)
+        train_loader = ShardedDataLoader(tmp_data_dir, "train", 32, 4, device)
+        val_loader = ShardedDataLoader(tmp_data_dir, "val", 32, 4, device)
+
+        with tempfile.TemporaryDirectory() as ckpt_dir:
+            train_loop(
+                model=model, train_loader=train_loader, val_loader=val_loader,
+                optimizer=optimizer, total_steps=5, warmup_steps=2, max_lr=1e-3,
+                grad_accum_steps=1, grad_clip=1.0, save_interval=5, eval_interval=5,
+                checkpoint_dir=ckpt_dir, model_name="test", device=device,
+                rank=0, world_size=1,
+            )
+            assert os.path.exists(os.path.join(ckpt_dir, "final.safetensors"))
