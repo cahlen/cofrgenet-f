@@ -14,7 +14,86 @@ import argparse
 import numpy as np
 import torch
 import torch.nn.functional as F
-from safetensors.torch import save_model, load_file
+from safetensors.torch import save_model, load_file, save_file
+import torch.distributed as dist
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+    MixedPrecision,
+    ShardingStrategy,
+    FullStateDictConfig,
+    StateDictType,
+)
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from functools import partial
+
+
+def is_distributed():
+    """Check if running in distributed mode (launched via torchrun)."""
+    return "RANK" in os.environ
+
+
+def setup_distributed():
+    """Initialize distributed training. Returns (rank, local_rank, world_size).
+    If not launched via torchrun, returns single-GPU defaults (0, 0, 1).
+    """
+    if not is_distributed():
+        return 0, 0, 1
+    rank = int(os.environ["RANK"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    dist.init_process_group("nccl")
+    torch.cuda.set_device(local_rank)
+    return rank, local_rank, world_size
+
+
+def cleanup_distributed():
+    """Clean up distributed process group."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def wrap_model_fsdp(model, device, use_gradient_checkpointing=False):
+    """Wrap a model with FSDP for distributed training.
+    Uses transformer_auto_wrap_policy to wrap each TransformerBlock as its own
+    FSDP unit. This keeps tok_emb and lm_head in the outer wrapper together,
+    preserving weight tying.
+    """
+    from src.baseline.model import TransformerBlock
+
+    if use_gradient_checkpointing:
+        for module in model.modules():
+            if isinstance(module, TransformerBlock):
+                module._original_forward = module.forward
+                module.forward = partial(
+                    _checkpointed_forward, module._original_forward
+                )
+
+    auto_wrap_policy = partial(
+        transformer_auto_wrap_policy,
+        transformer_layer_cls={TransformerBlock},
+    )
+
+    mixed_precision = MixedPrecision(
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.float32,
+        buffer_dtype=torch.bfloat16,
+    )
+
+    model = FSDP(
+        model,
+        auto_wrap_policy=auto_wrap_policy,
+        mixed_precision=mixed_precision,
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
+        device_id=device,
+        use_orig_params=True,
+    )
+    return model
+
+
+def _checkpointed_forward(original_forward, *args, **kwargs):
+    """Wrapper for gradient checkpointing."""
+    from torch.utils.checkpoint import checkpoint
+    return checkpoint(original_forward, *args, use_reentrant=False, **kwargs)
 
 
 class ShardedDataLoader:
