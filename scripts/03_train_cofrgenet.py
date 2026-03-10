@@ -16,7 +16,7 @@ from src.cofrgenet.model import CoFrGeNetTransformer, get_unfrozen_depth
 from scripts.train_common import (
     ShardedDataLoader, configure_optimizer, train_loop, add_training_args,
     setup_distributed, cleanup_distributed, wrap_model_fsdp, is_distributed,
-    load_checkpoint_fsdp
+    load_checkpoint_fsdp, load_experiment_config
 )
 
 
@@ -33,6 +33,9 @@ def main():
     parser.add_argument("--cf_depth", type=int, default=None)
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints/cofrgenet")
     args = parser.parse_args()
+
+    if args.config:
+        args = load_experiment_config(args.config, args)
 
     if args.max_steps is not None:
         args.total_steps = args.max_steps

@@ -11,6 +11,7 @@ import os
 import math
 import time
 import argparse
+import yaml
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -454,6 +455,18 @@ def train_loop(
         print(f"Final checkpoint: {final_path}")
 
 
+def load_experiment_config(config_path, args):
+    """Load experiment config from YAML. CLI args take precedence over YAML values.
+    Only sets values that are None (not explicitly provided on CLI).
+    """
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f)
+    for key, value in cfg.items():
+        if hasattr(args, key) and getattr(args, key) is None:
+            setattr(args, key, value)
+    return args
+
+
 def add_training_args(parser):
     """Add common training arguments to an argparse parser."""
     parser.add_argument("--data_dir", type=str, default="data/tokenized")
@@ -478,4 +491,6 @@ def add_training_args(parser):
     parser.add_argument("--no_wandb", action="store_true")
     parser.add_argument("--resume", action="store_true",
                         help="Resume from latest checkpoint in checkpoint_dir")
+    parser.add_argument("--config", type=str, default=None,
+                        help="Path to experiment YAML config file")
     return parser
