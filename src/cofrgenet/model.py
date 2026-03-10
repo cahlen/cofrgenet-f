@@ -64,6 +64,11 @@ class CoFrGeNetTransformer(nn.Module):
         for block in self.blocks:
             block.ffn.set_active_depth(depth)
 
+    def zero_frozen_grads(self):
+        """Zero frozen continued fraction depth gradients in all Cffn layers."""
+        for block in self.blocks:
+            block.ffn.zero_frozen_grads()
+
     def forward(self, idx, targets=None):
         B, S = idx.shape
         pos = torch.arange(0, S, dtype=torch.long, device=idx.device)

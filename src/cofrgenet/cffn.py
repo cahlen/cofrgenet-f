@@ -55,38 +55,22 @@ class Cffn(nn.Module):
 
         # Track active depth for dyadic schedule
         self._active_depth = depth
-        # Register hooks for depth-based gradient masking
-        self._grad_hooks = []
 
     def set_active_depth(self, active_depth):
-        """Set the active depth for dyadic training schedule.
-
-        Args:
-            active_depth: Maximum depth level with active gradients.
-                0 = only linear components (U, V, gate_proj); all ladder columns masked
-                1..d = unmask ladder columns 0..active_depth-1
-        """
+        """Set the active depth for dyadic training schedule."""
         self._active_depth = active_depth
-        # Remove old hooks
-        for hook in self._grad_hooks:
-            hook.remove()
-        self._grad_hooks = []
 
-        if active_depth >= self.depth:
-            return  # All depths active, no masking needed
-
-        # Install gradient hooks to zero out frozen depth columns
+    def zero_frozen_grads(self, active_depth=None):
+        """Zero out gradients for frozen depth columns.
+        Call between loss.backward() and optimizer.step().
+        Replaces register_hook approach which is unreliable with FSDP.
+        """
+        depth = active_depth if active_depth is not None else self._active_depth
+        if depth >= self.depth:
+            return
         for w in self.ladder_weights:
-            def make_hook(max_active):
-                def hook(grad):
-                    mask = torch.zeros_like(grad)
-                    # Columns 0..max_active-1 are active (depth 1..max_active)
-                    if max_active > 0:
-                        mask[:, :max_active] = 1.0
-                    return grad * mask
-                return hook
-            h = w.register_hook(make_hook(active_depth))
-            self._grad_hooks.append(h)
+            if w.grad is not None:
+                w.grad[:, depth:] = 0.0
 
     def forward(self, x):
         """Forward pass.

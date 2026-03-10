@@ -97,6 +97,7 @@ class TestCffnFreezing:
         y = cffn(x)
         loss = y.sum()
         loss.backward()
+        cffn.zero_frozen_grads()
 
         # U, V, and gate_proj should have gradients
         assert cffn.U.weight.grad is not None
@@ -118,6 +119,7 @@ class TestCffnFreezing:
         y = cffn(x)
         loss = y.sum()
         loss.backward()
+        cffn.zero_frozen_grads()
 
         # U, V, and gate_proj should have gradients
         assert cffn.U.weight.grad is not None
@@ -212,3 +214,15 @@ class TestCffnPVariate:
         cffn = Cffn(dim=p, num_ladders=L, depth=5)
         assert isinstance(cffn.V, nn.Parameter)
         assert cffn.V.shape == (p, L)
+
+
+def test_zero_frozen_grads():
+    """zero_frozen_grads should zero out gradient columns beyond active depth."""
+    from src.cofrgenet.cffn import Cffn
+    cffn = Cffn(dim=16, num_ladders=2, depth=5)
+    x = torch.randn(1, 4, 16)
+    y = cffn(x)
+    y.sum().backward()
+    cffn.zero_frozen_grads(active_depth=2)
+    for w in cffn.ladder_weights:
+        assert (w.grad[:, 2:] == 0).all(), "Frozen depth columns should have zero gradients"
