@@ -1,0 +1,14 @@
+# Phase 1: 1.5B Baseline — reproduce paper's GPT-2 XL scale
+n_layer: 48
+n_embd: 1600
+n_head: 25
+block_size: 1024
+total_steps: 95367
+warmup_steps: 2000
+lr: 3.0e-4
+weight_decay: 0.1
+batch_tokens: 524288
+micro_batch_size: 8
+checkpoint_dir: checkpoints/phase1-baseline-1.5b
+save_interval: 5000
+eval_interval: 1000
