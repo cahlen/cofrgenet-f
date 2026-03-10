@@ -25,8 +25,16 @@ def main():
                         help="Tokens per shard (default: 100M)")
     parser.add_argument("--val_fraction", type=float, default=0.01,
                         help="Fraction of tokens for validation (default: 0.01)")
-    parser.add_argument("--output_dir", type=str, default="data/tokenized",
+    default_output = "data/tokenized"
+    if os.path.isdir("/raid"):
+        default_output = "/raid/cofrgenet-f/data/tokenized"
+    parser.add_argument("--output_dir", type=str, default=default_output,
                         help="Output directory for tokenized shards")
+    parser.add_argument("--dataset_name", type=str, default="sample-10BT",
+                        choices=["sample-10BT", "sample-100BT", "sample-350BT"],
+                        help="FineWeb-Edu subset to download")
+    parser.add_argument("--max_tokens", type=int, default=None,
+                        help="Stop after this many tokens (e.g., 50000000000 for 50B)")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -34,8 +42,8 @@ def main():
     enc = tiktoken.get_encoding("gpt2")
     eot = enc._special_tokens["<|endoftext|>"]
 
-    print("Loading FineWeb-Edu sample-10BT (streaming)...")
-    ds = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT",
+    print(f"Loading FineWeb-Edu {args.dataset_name} (streaming)...")
+    ds = load_dataset("HuggingFaceFW/fineweb-edu", name=args.dataset_name,
                       split="train", streaming=True)
 
     # Tokenize and write shards
@@ -55,6 +63,9 @@ def main():
     pbar = tqdm(ds, unit=" docs")
 
     for doc in pbar:
+        if args.max_tokens and total_tokens >= args.max_tokens:
+            print(f"\nReached target of {args.max_tokens:,} tokens, stopping.")
+            break
         text = doc["text"]
         tokens = enc.encode_ordinary(text)
         tokens.append(eot)
