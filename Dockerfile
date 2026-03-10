@@ -1,4 +1,4 @@
-FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel
+FROM nvcr.io/nvidia/pytorch:24.12-py3
 
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/workspace
