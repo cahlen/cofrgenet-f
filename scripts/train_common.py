@@ -283,14 +283,17 @@ def load_checkpoint_fsdp(model, optimizer, checkpoint_dir, device="cpu"):
     return step
 
 
-def estimate_loss(model, data_loader, num_batches=20):
+def estimate_loss(model, data_loader, num_batches=20, use_autocast=True):
     """Estimate loss over num_batches."""
     model.eval()
     losses = []
     with torch.no_grad():
         for _ in range(num_batches):
             x, y = data_loader.next_batch()
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+            if use_autocast:
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    _, loss = model(x, y)
+            else:
                 _, loss = model(x, y)
             losses.append(loss.item())
     model.train()
@@ -315,6 +318,9 @@ def train_loop(
     step_callback=None,
     wandb_run=None,
     resume_step=0,
+    rank=0,
+    world_size=1,
+    grad_zero_callback=None,
 ):
     """Main training loop shared by both models.
 
@@ -323,18 +329,25 @@ def train_loop(
                        e.g., for dyadic schedule updates.
         wandb_run: Optional wandb run for logging.
         resume_step: Step to resume training from (0 = start from scratch).
+        rank: Process rank for distributed training (0 = main process).
+        world_size: Total number of processes (1 = single GPU).
+        grad_zero_callback: Optional fn() called after backward to zero frozen gradients.
     """
     model.train()
+
+    # FSDP MixedPrecision handles casting, so don't double-cast
+    use_autocast = not isinstance(model, FSDP)
 
     step = resume_step
     t0 = time.time()
     tokens_processed = 0
     batch_tokens = train_loader.batch_size * train_loader.block_size
 
-    if resume_step > 0:
-        print(f"Resuming training from step {resume_step}/{total_steps}")
-    print(f"Starting training: {total_steps} steps, {grad_accum_steps} grad accum steps")
-    print(f"Tokens per update: {batch_tokens * grad_accum_steps:,}")
+    if rank == 0:
+        if resume_step > 0:
+            print(f"Resuming training from step {resume_step}/{total_steps}")
+        print(f"Starting training: {total_steps} steps, {grad_accum_steps} grad accum steps")
+        print(f"Tokens per update: {batch_tokens * grad_accum_steps:,}")
 
     while step < total_steps:
         # Update learning rate
@@ -352,15 +365,25 @@ def train_loop(
 
         for micro_step in range(grad_accum_steps):
             x, y = train_loader.next_batch()
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+            if use_autocast:
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    _, loss = model(x, y)
+            else:
                 _, loss = model(x, y)
             loss = loss / grad_accum_steps
             loss_accum += loss.item()
             loss.backward()
 
-        # Gradient clipping
+        # Zero frozen gradients (dyadic schedule for CoFrGeNet-F)
+        if grad_zero_callback is not None:
+            grad_zero_callback()
+
+        # Gradient clipping — FSDP has its own method
         if grad_clip > 0:
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            if isinstance(model, FSDP):
+                grad_norm = model.clip_grad_norm_(grad_clip)
+            else:
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         else:
             grad_norm = 0.0
 
@@ -369,12 +392,18 @@ def train_loop(
         tokens_processed += batch_tokens * grad_accum_steps
         step += 1
 
+        # Sync loss across ranks for accurate logging
+        if world_size > 1:
+            loss_tensor = torch.tensor(loss_accum, device=device)
+            dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
+            loss_accum = loss_tensor.item()
+
         # Advance shard periodically
         if step % 100 == 0:
             train_loader.advance_shard()
 
         # Logging
-        if step % 10 == 0 or step == 1:
+        if rank == 0 and (step % 10 == 0 or step == 1):
             dt = time.time() - t0
             tokens_per_sec = tokens_processed / dt if dt > 0 else 0
             print(
@@ -394,27 +423,35 @@ def train_loop(
                     "train/tokens": tokens_processed,
                 }, step=step)
 
-        # Log val loss
+        # Log val loss — ALL ranks must participate (FSDP deadlock prevention)
         if step % eval_interval == 0 or step == total_steps:
-            val_loss = estimate_loss(model, val_loader)
-            print(f"  >>> val_loss: {val_loss:.4f}")
-            if wandb_run is not None:
-                wandb_run.log({"val/loss": val_loss}, step=step)
+            val_loss = estimate_loss(model, val_loader, use_autocast=use_autocast)
+            if world_size > 1:
+                vl_tensor = torch.tensor(val_loss, device=device)
+                dist.all_reduce(vl_tensor, op=dist.ReduceOp.AVG)
+                val_loss = vl_tensor.item()
+            if rank == 0:
+                print(f"  >>> val_loss: {val_loss:.4f}")
+                if wandb_run is not None:
+                    wandb_run.log({"val/loss": val_loss}, step=step)
 
         # Checkpoint
         if step % save_interval == 0 or step == total_steps:
             ckpt_path = os.path.join(checkpoint_dir, f"step_{step:06d}.safetensors")
-            save_checkpoint(model, optimizer, step, loss_accum, ckpt_path)
-            print(f"  >>> saved checkpoint: {ckpt_path}")
+            save_checkpoint_fsdp(model, optimizer, step, loss_accum, ckpt_path, rank=rank)
+            if rank == 0:
+                print(f"  >>> saved checkpoint: {ckpt_path}")
 
     total_time = time.time() - t0
-    print(f"\nTraining complete! {total_steps} steps in {total_time:.1f}s")
-    print(f"Average throughput: {tokens_processed / total_time:,.0f} tok/s")
+    if rank == 0:
+        print(f"\nTraining complete! {total_steps} steps in {total_time:.1f}s")
+        print(f"Average throughput: {tokens_processed / total_time:,.0f} tok/s")
 
     # Save final checkpoint
     final_path = os.path.join(checkpoint_dir, "final.safetensors")
-    save_checkpoint(model, optimizer, step, loss_accum, final_path)
-    print(f"Final checkpoint: {final_path}")
+    save_checkpoint_fsdp(model, optimizer, step, loss_accum, final_path, rank=rank)
+    if rank == 0:
+        print(f"Final checkpoint: {final_path}")
 
 
 def add_training_args(parser):
