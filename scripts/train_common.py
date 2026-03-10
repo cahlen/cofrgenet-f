@@ -226,6 +226,63 @@ def resume_from_checkpoint(model, optimizer, checkpoint_dir, device):
     return step
 
 
+def save_checkpoint_fsdp(model, optimizer, step, loss, path, rank=0):
+    """Save checkpoint, handling both FSDP and non-FSDP models.
+    For FSDP: gathers full state dict on rank 0, saves there only.
+    For non-FSDP: saves normally (same as existing save_checkpoint).
+    """
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+
+    if isinstance(model, FSDP):
+        cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, cfg):
+            state_dict = model.state_dict()
+            if rank == 0:
+                save_file(state_dict, path)
+        if rank == 0:
+            opt_path = path.replace(".safetensors", "_optim.pt")
+            optim_state = FSDP.optim_state_dict(model, optimizer)
+            torch.save({"optimizer": optim_state, "step": step, "loss": loss}, opt_path)
+    else:
+        save_model(model, path)
+        opt_path = path.replace(".safetensors", "_optim.pt")
+        torch.save({"optimizer": optimizer.state_dict(), "step": step, "loss": loss}, opt_path)
+
+
+def load_checkpoint_fsdp(model, optimizer, checkpoint_dir, device="cpu"):
+    """Load latest checkpoint, handling both FSDP and non-FSDP models.
+    Returns the step to resume from, or 0 if no checkpoint found.
+    """
+    result = find_latest_checkpoint(checkpoint_dir)
+    if result is None:
+        return 0
+    step, ckpt_path = result
+    opt_path = ckpt_path.replace(".safetensors", "_optim.pt")
+
+    print(f"Resuming from checkpoint: {ckpt_path} (step {step})")
+
+    if isinstance(model, FSDP):
+        state_dict = load_file(ckpt_path)
+        cleaned = {k.removeprefix("_orig_mod."): v for k, v in state_dict.items()}
+        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT):
+            model.load_state_dict(cleaned, strict=False)
+        if os.path.exists(opt_path):
+            opt_state = torch.load(opt_path, map_location=device, weights_only=False)
+            optim_state = FSDP.optim_state_dict_to_load(
+                model, optimizer, opt_state["optimizer"]
+            )
+            optimizer.load_state_dict(optim_state)
+    else:
+        state_dict = load_file(ckpt_path)
+        cleaned = {k.removeprefix("_orig_mod."): v for k, v in state_dict.items()}
+        model.load_state_dict(cleaned, strict=False)
+        if os.path.exists(opt_path):
+            opt_state = torch.load(opt_path, map_location=device, weights_only=False)
+            optimizer.load_state_dict(opt_state["optimizer"])
+
+    return step
+
+
 def estimate_loss(model, data_loader, num_batches=20):
     """Estimate loss over num_batches."""
     model.eval()
