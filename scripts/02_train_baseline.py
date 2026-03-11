@@ -15,7 +15,7 @@ from src.baseline.model import BaselineTransformer
 from scripts.train_common import (
     ShardedDataLoader, configure_optimizer, train_loop, add_training_args,
     setup_distributed, cleanup_distributed, wrap_model_fsdp, is_distributed,
-    load_checkpoint_fsdp, load_experiment_config
+    load_checkpoint_fsdp, load_experiment_config, setup_torch_performance
 )
 
 
@@ -32,12 +32,13 @@ def main():
     args = parser.parse_args()
 
     if args.config:
-        args = load_experiment_config(args.config, args)
+        args = load_experiment_config(args.config, args, parser=parser)
 
     if args.max_steps is not None:
         args.total_steps = args.max_steps
 
-    # Distributed setup
+    # Performance + distributed setup
+    setup_torch_performance()
     rank, local_rank, world_size = setup_distributed()
     device = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
 
@@ -70,13 +71,14 @@ def main():
 
     if args.compile:
         if rank == 0:
-            print("Compiling model with torch.compile...")
-        model = torch.compile(model)
+            print("Compiling model with torch.compile(mode='max-autotune')...")
+        model = torch.compile(model, mode="max-autotune")
 
-    # Data
-    grad_accum_steps = args.batch_tokens // (args.micro_batch_size * args.block_size)
+    # Data — account for world_size: each GPU processes micro_batch_size independently
+    grad_accum_steps = max(1, args.batch_tokens // (args.micro_batch_size * args.block_size * world_size))
     if rank == 0:
-        print(f"Gradient accumulation steps: {grad_accum_steps}")
+        effective_batch = args.micro_batch_size * args.block_size * world_size * grad_accum_steps
+        print(f"Gradient accumulation steps: {grad_accum_steps} (effective batch: {effective_batch:,} tokens)")
 
     train_loader = ShardedDataLoader(
         args.data_dir, "train", args.block_size, args.micro_batch_size, device,
@@ -97,18 +99,26 @@ def main():
     if args.resume:
         resume_step = load_checkpoint_fsdp(model, optimizer, args.checkpoint_dir, device)
 
-    # Wandb — only on rank 0
+    # Tracking — trackio (HF Spaces dashboard)
     wandb_run = None
     if rank == 0 and not args.no_wandb:
         try:
-            import wandb
-            wandb_run = wandb.init(
+            import trackio
+            init_kwargs = dict(
                 project=args.wandb_project,
-                name=args.wandb_run_name or "baseline-125m",
+                name=args.wandb_run_name or f"baseline-{total_params // 1_000_000}m",
                 config=vars(args),
+                space_id=args.trackio_space,
+                auto_log_gpu=True,
+                gpu_log_interval=30.0,
             )
+            if args.trackio_group:
+                init_kwargs["group"] = args.trackio_group
+            trackio.init(**init_kwargs)
+            wandb_run = trackio  # trackio has wandb-compatible .log() API
+            print(f"Trackio initialized → {args.trackio_space or 'local'}")
         except Exception as e:
-            print(f"wandb init failed: {e}, continuing without logging")
+            print(f"Trackio init failed: {e}, continuing without logging")
 
     # Train
     train_loop(
@@ -130,10 +140,14 @@ def main():
         resume_step=resume_step,
         rank=rank,
         world_size=world_size,
+        trackio_space=args.trackio_space if not args.no_wandb else None,
     )
 
-    if wandb_run is not None:
-        wandb_run.finish()
+    try:
+        import trackio
+        trackio.finish()
+    except Exception:
+        pass
 
     cleanup_distributed()
 

@@ -1,0 +1,18 @@
+# Pair 5: 7.9B CoFrGeNet-F — push scale, deeper CF ladders
+# 38% fewer params than 12.9B baseline
+n_layer: 40
+n_embd: 5632
+n_head: 44
+num_ladders: 5
+cf_depth: 7
+block_size: 1024
+total_steps: 190734   # 100B tokens / 524288 batch_tokens
+warmup_steps: 2000
+lr: 1.5e-4
+weight_decay: 0.1
+batch_tokens: 524288
+micro_batch_size: 2
+checkpoint_dir: checkpoints/pair5-cofrgenet-8b
+save_interval: 5000
+eval_interval: 1000
+trackio_group: pair5-13b

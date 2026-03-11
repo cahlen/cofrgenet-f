@@ -2,8 +2,8 @@
 # Launch distributed training on B200 GPUs via torchrun
 #
 # Usage:
-#   ./scripts/launch_training.sh cofrgenet [--config configs/experiments/phase1_cofrgenet_1b.yaml]
-#   ./scripts/launch_training.sh baseline [--n_embd 1600 --n_head 25 --n_layer 48]
+#   ./scripts/launch_training.sh cofrgenet --config configs/experiments/phase1_cofrgenet_1b.yaml
+#   ./scripts/launch_training.sh baseline --config configs/experiments/phase1_baseline_1.5b.yaml
 #
 # Environment variables:
 #   NPROC     - Number of GPUs (default: 8)
@@ -26,15 +26,26 @@ else
     exit 1
 fi
 
-echo "Launching $MODEL_TYPE training on $NPROC GPUs..."
-echo "Data dir: $DATA_DIR"
-echo "Extra args: $@"
+# ── B200/Blackwell performance settings ──
+# NCCL auto-tunes on Blackwell NVLink topology — no manual algo override needed
+# Async error handling for faster collective ops
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+# Use CUDA memory pool for NCCL allocations (zero-copy over NVLink)
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# torch.compile cache — persist compiled kernels across restarts
+export TORCHINDUCTOR_CACHE_DIR="${HOME}/.cache/torch_inductor"
+export TORCHINDUCTOR_FX_GRAPH_CACHE=1
 
-torchrun \
+echo "════════════════════════════════════════════════════════════"
+echo "  Launching $MODEL_TYPE training on $NPROC GPUs"
+echo "  Data dir: $DATA_DIR"
+echo "  Extra args: $@"
+echo "════════════════════════════════════════════════════════════"
+
+PYTHONPATH=. torchrun \
     --standalone \
     --nproc_per_node="$NPROC" \
     "$SCRIPT" \
     --data_dir "$DATA_DIR" \
     --compile \
-    --no_wandb \
     "$@"

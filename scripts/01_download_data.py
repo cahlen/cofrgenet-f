@@ -1,26 +1,55 @@
-"""Download and tokenize FineWeb-Edu 10BT into binary shards.
+"""Download and tokenize FineWeb-Edu into binary shards.
 
 Downloads the HuggingFace dataset in streaming mode, tokenizes with GPT-2
 tokenizer (tiktoken), and writes shards as np.uint16 binary files.
+
+Supports --resume to continue from where a previous run was interrupted.
+Progress is tracked via a JSON file in the output directory.
 
 Output:
     data/tokenized/train_000.bin, train_001.bin, ...
     data/tokenized/val_000.bin
 
 Usage:
-    python scripts/01_download_data.py [--shard_size 100000000] [--val_fraction 0.01]
+    python scripts/01_download_data.py
+    python scripts/01_download_data.py --dataset_name sample-100BT --max_tokens 50000000000
+    python scripts/01_download_data.py --resume  # continue interrupted download
 """
 
 import argparse
+import json
 import os
 import numpy as np
 import tiktoken
 from datasets import load_dataset
 from tqdm import tqdm
 
+PROGRESS_FILE = "progress.json"
+
+
+def load_progress(output_dir):
+    """Load progress state from a previous run."""
+    path = os.path.join(output_dir, PROGRESS_FILE)
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
+def save_progress(output_dir, docs_processed, shard_idx, total_tokens, val_done):
+    """Save progress state for resume capability."""
+    path = os.path.join(output_dir, PROGRESS_FILE)
+    with open(path, "w") as f:
+        json.dump({
+            "docs_processed": docs_processed,
+            "shard_idx": shard_idx,
+            "total_tokens": total_tokens,
+            "val_done": val_done,
+        }, f)
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Download and tokenize FineWeb-Edu 10BT")
+    parser = argparse.ArgumentParser(description="Download and tokenize FineWeb-Edu")
     parser.add_argument("--shard_size", type=int, default=100_000_000,
                         help="Tokens per shard (default: 100M)")
     parser.add_argument("--val_fraction", type=float, default=0.01,
@@ -35,6 +64,8 @@ def main():
                         help="FineWeb-Edu subset to download")
     parser.add_argument("--max_tokens", type=int, default=None,
                         help="Stop after this many tokens (e.g., 50000000000 for 50B)")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from a previous interrupted run")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -42,30 +73,54 @@ def main():
     enc = tiktoken.get_encoding("gpt2")
     eot = enc._special_tokens["<|endoftext|>"]
 
+    # Resume state
+    skip_docs = 0
+    shard_idx = 0
+    total_tokens = 0
+    val_done = False
+
+    if args.resume:
+        progress = load_progress(args.output_dir)
+        if progress is not None:
+            skip_docs = progress["docs_processed"]
+            shard_idx = progress["shard_idx"]
+            total_tokens = progress["total_tokens"]
+            val_done = progress["val_done"]
+            print(f"Resuming: skipping {skip_docs:,} docs, "
+                  f"starting at shard {shard_idx}, "
+                  f"{total_tokens/1e9:.2f}B tokens already done")
+        else:
+            print("No progress file found, starting from scratch.")
+
     print(f"Loading FineWeb-Edu {args.dataset_name} (streaming)...")
     ds = load_dataset("HuggingFaceFW/fineweb-edu", name=args.dataset_name,
                       split="train", streaming=True)
 
+    if skip_docs > 0:
+        print(f"Skipping {skip_docs:,} documents...")
+        ds = ds.skip(skip_docs)
+
     # Tokenize and write shards
-    shard_idx = 0
     token_buf = np.empty(args.shard_size, dtype=np.uint16)
     buf_pos = 0
-    total_tokens = 0
     val_tokens = []
-    val_done = False
+    docs_processed = skip_docs
 
-    # We'll collect ~1% of tokens for validation from the start,
-    # then switch to writing train shards.
-    # Estimate: 10B tokens total, 1% = 100M tokens = 1 shard for val.
-    val_target = int(args.shard_size * 1)  # 1 shard worth of val data
+    # 1 shard worth of val data
+    val_target = int(args.shard_size * 1)
+
+    # Save progress every N shards
+    save_every_shards = 5
 
     print(f"Tokenizing... (shard size: {args.shard_size:,} tokens)")
-    pbar = tqdm(ds, unit=" docs")
+    pbar = tqdm(ds, unit=" docs", initial=skip_docs)
 
     for doc in pbar:
         if args.max_tokens and total_tokens >= args.max_tokens:
             print(f"\nReached target of {args.max_tokens:,} tokens, stopping.")
             break
+
+        docs_processed += 1
         text = doc["text"]
         tokens = enc.encode_ordinary(text)
         tokens.append(eot)
@@ -105,12 +160,19 @@ def main():
                 shard_idx += 1
                 buf_pos = 0
 
+                if shard_idx % save_every_shards == 0:
+                    save_progress(args.output_dir, docs_processed,
+                                  shard_idx, total_tokens, val_done)
+
     # Write final partial shard if any
     if buf_pos > 0:
         shard_path = os.path.join(args.output_dir, f"train_{shard_idx:03d}.bin")
         token_buf[:buf_pos].tofile(shard_path)
         total_tokens += buf_pos
         shard_idx += 1
+
+    # Save final progress
+    save_progress(args.output_dir, docs_processed, shard_idx, total_tokens, val_done)
 
     print(f"\nDone! {total_tokens:,} total tokens in {shard_idx} train shards + 1 val shard")
     print(f"Output directory: {args.output_dir}")

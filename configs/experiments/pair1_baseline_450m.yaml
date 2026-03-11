@@ -1,0 +1,17 @@
+# Pair 1: 450M Baseline — sanity check at small scale
+# Validates 8-GPU pipeline before committing to larger runs
+n_layer: 12
+n_embd: 1600
+n_head: 25
+block_size: 1024
+total_steps: 95367    # 50B tokens / 524288 batch_tokens
+warmup_steps: 700
+lr: 6.0e-4
+weight_decay: 0.1
+batch_tokens: 524288
+micro_batch_size: 64  # B200 has 179GB VRAM — 16 was wasting 95% of memory
+compile: true         # ~1.5-2x throughput boost
+checkpoint_dir: checkpoints/pair1-baseline-450m
+save_interval: 5000
+eval_interval: 1000
+trackio_group: pair1-450m

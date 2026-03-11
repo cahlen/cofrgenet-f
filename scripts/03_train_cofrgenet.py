@@ -16,7 +16,7 @@ from src.cofrgenet.model import CoFrGeNetTransformer, get_unfrozen_depth
 from scripts.train_common import (
     ShardedDataLoader, configure_optimizer, train_loop, add_training_args,
     setup_distributed, cleanup_distributed, wrap_model_fsdp, is_distributed,
-    load_checkpoint_fsdp, load_experiment_config
+    load_checkpoint_fsdp, load_experiment_config, setup_torch_performance
 )
 
 
@@ -35,12 +35,13 @@ def main():
     args = parser.parse_args()
 
     if args.config:
-        args = load_experiment_config(args.config, args)
+        args = load_experiment_config(args.config, args, parser=parser)
 
     if args.max_steps is not None:
         args.total_steps = args.max_steps
 
-    # Distributed setup
+    # Performance + distributed setup
+    setup_torch_performance()
     rank, local_rank, world_size = setup_distributed()
     device = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
 
@@ -76,10 +77,11 @@ def main():
     if world_size > 1:
         model = wrap_model_fsdp(model, device, use_gradient_checkpointing=use_grad_ckpt)
 
-    # Data
-    grad_accum_steps = args.batch_tokens // (args.micro_batch_size * args.block_size)
+    # Data — account for world_size: each GPU processes micro_batch_size independently
+    grad_accum_steps = max(1, args.batch_tokens // (args.micro_batch_size * args.block_size * world_size))
     if rank == 0:
-        print(f"Gradient accumulation steps: {grad_accum_steps}")
+        effective_batch = args.micro_batch_size * args.block_size * world_size * grad_accum_steps
+        print(f"Gradient accumulation steps: {grad_accum_steps} (effective batch: {effective_batch:,} tokens)")
 
     train_loader = ShardedDataLoader(
         args.data_dir, "train", args.block_size, args.micro_batch_size, device,
@@ -102,40 +104,91 @@ def main():
 
     if args.compile:
         if rank == 0:
-            print("Compiling model with torch.compile...")
-        model = torch.compile(model)
+            print("Compiling model with torch.compile(mode='max-autotune')...")
+        model = torch.compile(model, mode="max-autotune")
 
-    # Dyadic schedule callback
+    # Dyadic schedule callback — with loss monitoring around depth changes.
+    # Unfreezing a new depth can destabilize training; we track loss before/after
+    # to alert if a depth change causes divergence.
     max_depth = config.cf_depth
     last_depth = [-1]  # mutable for closure
+    depth_change_state = {"step": None, "loss_before": None}  # for post-change monitoring
 
     def dyadic_callback(step, total_steps):
         depth = get_unfrozen_depth(step, total_steps, max_depth)
         if depth != last_depth[0]:
             if rank == 0:
                 print(f"  >>> Dyadic schedule: unfreezing depth {depth} at step {step}")
+                try:
+                    import trackio
+                    trackio.alert(
+                        title=f"Dyadic depth change: depth {last_depth[0]} -> {depth}",
+                        text=f"Unfreezing continued fraction depth {depth}/{max_depth} at step {step}/{total_steps}. "
+                             f"Watch for loss spikes in the next ~100 steps.",
+                        level=trackio.AlertLevel.INFO,
+                    )
+                except Exception:
+                    pass
+                # Record state for post-change monitoring
+                depth_change_state["step"] = step
+                depth_change_state["loss_before"] = None  # will be set from train loop
             unwrapped = model.module if hasattr(model, 'module') else model
             unwrapped = getattr(unwrapped, '_orig_mod', unwrapped)
             unwrapped.set_active_depth(depth)
             last_depth[0] = depth
+
+    def check_depth_change_stability(step, current_loss):
+        """Called from train loop to monitor loss after dyadic depth changes."""
+        if depth_change_state["step"] is None or rank != 0:
+            return
+        # Record loss at time of depth change
+        if depth_change_state["loss_before"] is None:
+            depth_change_state["loss_before"] = current_loss
+            return
+        # Check 50 steps after depth change
+        steps_since = step - depth_change_state["step"]
+        if steps_since == 50:
+            loss_before = depth_change_state["loss_before"]
+            if current_loss > loss_before * 1.5:  # 50% worse
+                try:
+                    import trackio
+                    trackio.alert(
+                        title="Loss destabilized after depth change",
+                        text=f"Loss jumped from {loss_before:.4f} to {current_loss:.4f} "
+                             f"({(current_loss/loss_before - 1)*100:.0f}% increase) "
+                             f"within 50 steps of unfreezing depth {last_depth[0]}. "
+                             f"This may recover, but if it persists, the depth change caused divergence.",
+                        level=trackio.AlertLevel.WARN,
+                    )
+                except Exception:
+                    pass
+            depth_change_state["step"] = None  # reset
 
     def grad_zero_callback():
         unwrapped = model.module if hasattr(model, 'module') else model
         unwrapped = getattr(unwrapped, '_orig_mod', unwrapped)
         unwrapped.zero_frozen_grads()
 
-    # Wandb — only on rank 0
+    # Tracking — trackio (HF Spaces dashboard)
     wandb_run = None
     if rank == 0 and not args.no_wandb:
         try:
-            import wandb
-            wandb_run = wandb.init(
+            import trackio
+            init_kwargs = dict(
                 project=args.wandb_project,
                 name=args.wandb_run_name or f"cofrgenet-f-{total_params // 1_000_000}m",
                 config=vars(args),
+                space_id=args.trackio_space,
+                auto_log_gpu=True,
+                gpu_log_interval=30.0,
             )
+            if args.trackio_group:
+                init_kwargs["group"] = args.trackio_group
+            trackio.init(**init_kwargs)
+            wandb_run = trackio  # trackio has wandb-compatible .log() API
+            print(f"Trackio initialized → {args.trackio_space or 'local'}")
         except Exception as e:
-            print(f"wandb init failed: {e}, continuing without logging")
+            print(f"Trackio init failed: {e}, continuing without logging")
 
     # Train
     train_loop(
@@ -159,10 +212,15 @@ def main():
         rank=rank,
         world_size=world_size,
         grad_zero_callback=grad_zero_callback,
+        trackio_space=args.trackio_space if not args.no_wandb else None,
+        loss_callback=check_depth_change_stability,
     )
 
-    if wandb_run is not None:
-        wandb_run.finish()
+    try:
+        import trackio
+        trackio.finish()
+    except Exception:
+        pass
 
     cleanup_distributed()
 

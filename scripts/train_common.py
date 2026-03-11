@@ -17,6 +17,7 @@ import torch
 import torch.nn.functional as F
 from safetensors.torch import save_model, load_file, save_file
 import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
     MixedPrecision,
@@ -26,6 +27,17 @@ from torch.distributed.fsdp import (
 )
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from functools import partial
+
+
+def setup_torch_performance():
+    """Enable performance optimizations for CUDA training."""
+    # TF32: use TensorFloat32 for float32 matmuls (3x faster on Ampere+)
+    torch.set_float32_matmul_precision("high")
+    # cuDNN benchmark: auto-tune conv algorithms
+    torch.backends.cudnn.benchmark = True
+    # Allow TF32 on matmul and cuDNN
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
 
 def is_distributed():
@@ -53,11 +65,11 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 
-def wrap_model_fsdp(model, device, use_gradient_checkpointing=False):
-    """Wrap a model with FSDP for distributed training.
-    Uses transformer_auto_wrap_policy to wrap each TransformerBlock as its own
-    FSDP unit. This keeps tok_emb and lm_head in the outer wrapper together,
-    preserving weight tying.
+def wrap_model_distributed(model, device, use_gradient_checkpointing=False, force_fsdp=False):
+    """Wrap a model for distributed training.
+
+    For models <2B params: uses DDP (simpler, faster, no dtype issues with torch.compile).
+    For models >=2B params: uses FSDP FULL_SHARD (required to fit in GPU memory).
     """
     from src.baseline.model import TransformerBlock
 
@@ -69,26 +81,36 @@ def wrap_model_fsdp(model, device, use_gradient_checkpointing=False):
                     _checkpointed_forward, module._original_forward
                 )
 
-    auto_wrap_policy = partial(
-        transformer_auto_wrap_policy,
-        transformer_layer_cls={TransformerBlock},
-    )
+    total_params = sum(p.numel() for p in model.parameters())
+    use_fsdp = force_fsdp or total_params >= 2_000_000_000
 
-    mixed_precision = MixedPrecision(
-        param_dtype=torch.bfloat16,
-        reduce_dtype=torch.float32,
-        buffer_dtype=torch.bfloat16,
-    )
+    if use_fsdp:
+        auto_wrap_policy = partial(
+            transformer_auto_wrap_policy,
+            transformer_layer_cls={TransformerBlock},
+        )
+        mixed_precision = MixedPrecision(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+            buffer_dtype=torch.bfloat16,
+        )
+        model = FSDP(
+            model,
+            auto_wrap_policy=auto_wrap_policy,
+            mixed_precision=mixed_precision,
+            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            device_id=device,
+            use_orig_params=True,
+        )
+    else:
+        model = model.bfloat16()
+        model = DDP(model, device_ids=[device])
 
-    model = FSDP(
-        model,
-        auto_wrap_policy=auto_wrap_policy,
-        mixed_precision=mixed_precision,
-        sharding_strategy=ShardingStrategy.FULL_SHARD,
-        device_id=device,
-        use_orig_params=True,
-    )
     return model
+
+
+# Keep old name as alias for backwards compatibility
+wrap_model_fsdp = wrap_model_distributed
 
 
 def _checkpointed_forward(original_forward, *args, **kwargs):
@@ -275,8 +297,15 @@ def load_checkpoint_fsdp(model, optimizer, checkpoint_dir, device="cpu"):
             optimizer.load_state_dict(optim_state)
     else:
         state_dict = load_file(ckpt_path)
-        cleaned = {k.removeprefix("_orig_mod."): v for k, v in state_dict.items()}
-        model.load_state_dict(cleaned, strict=False)
+        # Strip prefixes from torch.compile (_orig_mod.) and DDP (module.)
+        cleaned = {k.removeprefix("_orig_mod.").removeprefix("module."): v for k, v in state_dict.items()}
+        # DDP models need loading into .module, compiled DDP into ._orig_mod.module
+        target = model
+        if hasattr(model, '_orig_mod'):
+            target = model._orig_mod
+        if hasattr(target, 'module'):
+            target = target.module
+        target.load_state_dict(cleaned, strict=False)
         if os.path.exists(opt_path):
             opt_state = torch.load(opt_path, map_location=device, weights_only=False)
             optimizer.load_state_dict(opt_state["optimizer"])
@@ -322,17 +351,21 @@ def train_loop(
     rank=0,
     world_size=1,
     grad_zero_callback=None,
+    trackio_space=None,
+    loss_callback=None,
 ):
     """Main training loop shared by both models.
 
     Args:
         step_callback: Optional fn(step, total_steps) called each step,
                        e.g., for dyadic schedule updates.
-        wandb_run: Optional wandb run for logging.
+        wandb_run: Optional wandb run for logging (also used by trackio).
         resume_step: Step to resume training from (0 = start from scratch).
         rank: Process rank for distributed training (0 = main process).
         world_size: Total number of processes (1 = single GPU).
         grad_zero_callback: Optional fn() called after backward to zero frozen gradients.
+        trackio_space: Optional HF Space ID for periodic trackio sync.
+        loss_callback: Optional fn(step, loss) called after each step for custom monitoring.
     """
     model.train()
 
@@ -343,6 +376,12 @@ def train_loop(
     t0 = time.time()
     tokens_processed = 0
     batch_tokens = train_loader.batch_size * train_loader.block_size
+
+    # Alert tracking state
+    prev_val_loss = None
+    loss_history = []
+    throughput_baseline = None  # established after torch.compile warmup
+    throughput_alert_step = 0   # throttle throughput alerts
 
     if rank == 0:
         if resume_step > 0:
@@ -390,7 +429,7 @@ def train_loop(
 
         optimizer.step()
 
-        tokens_processed += batch_tokens * grad_accum_steps
+        tokens_processed += batch_tokens * grad_accum_steps * world_size
         step += 1
 
         # Sync loss across ranks for accurate logging
@@ -403,26 +442,66 @@ def train_loop(
         if step % 100 == 0:
             train_loader.advance_shard()
 
+        # ── Alerts: detect training problems (rank 0 only) ──
+        if rank == 0:
+            _check_training_alerts(
+                step, total_steps, loss_accum, float(grad_norm),
+                loss_history, warmup_steps, wandb_run, t0,
+            )
+
+        # Custom loss monitoring (e.g., dyadic depth change stability)
+        if loss_callback is not None:
+            loss_callback(step, loss_accum)
+
         # Logging
         if rank == 0 and (step % 10 == 0 or step == 1):
             dt = time.time() - t0
             tokens_per_sec = tokens_processed / dt if dt > 0 else 0
+            ppl = math.exp(min(loss_accum, 20))  # cap to avoid overflow
             print(
                 f"step {step:>6d}/{total_steps} | "
-                f"loss {loss_accum:.4f} | "
+                f"loss {loss_accum:.4f} | ppl {ppl:.1f} | "
                 f"lr {lr:.2e} | "
-                f"grad_norm {grad_norm:.2f} | "
+                f"grad_norm {float(grad_norm):.2f} | "
                 f"tok/s {tokens_per_sec:,.0f}"
             )
 
             if wandb_run is not None:
                 wandb_run.log({
                     "train/loss": loss_accum,
+                    "train/perplexity": ppl,
                     "train/lr": lr,
                     "train/grad_norm": float(grad_norm),
                     "train/tokens_per_sec": tokens_per_sec,
                     "train/tokens": tokens_processed,
                 }, step=step)
+
+            # Throughput collapse detection (after compile warmup at step 100)
+            if step == 100:
+                throughput_baseline = tokens_per_sec
+            if (throughput_baseline is not None and tokens_per_sec < throughput_baseline * 0.5
+                    and step > throughput_alert_step + 500):  # throttle to once per 500 steps
+                _fire_alert(
+                    "Throughput collapse — GPU may be stalled",
+                    f"Throughput dropped to {tokens_per_sec:,.0f} tok/s "
+                    f"({tokens_per_sec/throughput_baseline*100:.0f}% of baseline {throughput_baseline:,.0f}). "
+                    f"Check for OOM swapping, NCCL hangs, or GPU thermal throttling. "
+                    f"Every slow hour wastes limited cluster time.",
+                    "warn", wandb_run,
+                )
+                throughput_alert_step = step
+
+        # Periodic trackio sync to HF Space (every 500 steps)
+        if rank == 0 and trackio_space and step % 500 == 0:
+            try:
+                import trackio
+                trackio.sync(
+                    project=wandb_run._project if hasattr(wandb_run, '_project') else "cofrgenet-f",
+                    space_id=trackio_space,
+                    run_in_background=True,
+                )
+            except Exception:
+                pass  # sync failure is not fatal
 
         # Log val loss — ALL ranks must participate (FSDP deadlock prevention)
         if step % eval_interval == 0 or step == total_steps:
@@ -432,9 +511,16 @@ def train_loop(
                 dist.all_reduce(vl_tensor, op=dist.ReduceOp.AVG)
                 val_loss = vl_tensor.item()
             if rank == 0:
-                print(f"  >>> val_loss: {val_loss:.4f}")
+                val_ppl = math.exp(min(val_loss, 20))
+                print(f"  >>> val_loss: {val_loss:.4f} | val_ppl: {val_ppl:.1f}")
                 if wandb_run is not None:
-                    wandb_run.log({"val/loss": val_loss}, step=step)
+                    wandb_run.log({
+                        "val/loss": val_loss,
+                        "val/perplexity": val_ppl,
+                    }, step=step)
+                # Alert on val loss regression
+                _check_val_loss_alert(step, val_loss, prev_val_loss, wandb_run)
+                prev_val_loss = val_loss
 
         # Checkpoint
         if step % save_interval == 0 or step == total_steps:
@@ -442,11 +528,25 @@ def train_loop(
             save_checkpoint_fsdp(model, optimizer, step, loss_accum, ckpt_path, rank=rank)
             if rank == 0:
                 print(f"  >>> saved checkpoint: {ckpt_path}")
+                _fire_alert(
+                    "Checkpoint saved",
+                    f"Step {step}/{total_steps}, loss {loss_accum:.4f}, saved to {os.path.basename(ckpt_path)}",
+                    "info", wandb_run,
+                )
 
     total_time = time.time() - t0
     if rank == 0:
+        final_ppl = math.exp(min(loss_accum, 20))
+        avg_tps = tokens_processed / total_time
         print(f"\nTraining complete! {total_steps} steps in {total_time:.1f}s")
-        print(f"Average throughput: {tokens_processed / total_time:,.0f} tok/s")
+        print(f"Average throughput: {avg_tps:,.0f} tok/s")
+        print(f"Final loss: {loss_accum:.4f} | Final perplexity: {final_ppl:.1f}")
+        _fire_alert(
+            "Training complete",
+            f"{model_name}: {total_steps} steps in {total_time/3600:.1f}h, "
+            f"final loss {loss_accum:.4f}, ppl {final_ppl:.1f}, {avg_tps:,.0f} tok/s",
+            "info", wandb_run,
+        )
 
     # Save final checkpoint
     final_path = os.path.join(checkpoint_dir, "final.safetensors")
@@ -455,15 +555,226 @@ def train_loop(
         print(f"Final checkpoint: {final_path}")
 
 
-def load_experiment_config(config_path, args):
+def _fire_alert(title, text, level, wandb_run):
+    """Fire a trackio alert if trackio is the backend, otherwise just print."""
+    try:
+        import trackio
+        level_map = {
+            "info": trackio.AlertLevel.INFO,
+            "warn": trackio.AlertLevel.WARN,
+            "error": trackio.AlertLevel.ERROR,
+        }
+        trackio.alert(title=title, text=text, level=level_map.get(level, trackio.AlertLevel.WARN))
+    except Exception:
+        print(f"  [ALERT/{level.upper()}] {title}: {text}")
+
+
+def _check_training_alerts(step, total_steps, loss, grad_norm, loss_history, warmup_steps, wandb_run, t0=None,
+                           _alert_state={}):
+    """Check for training anomalies and fire alerts.
+
+    Comprehensive alerts tailored for CoFrGeNet-F scaling experiments:
+    - ERROR: NaN/Inf, early divergence, loss explosion after dyadic depth change
+    - WARN: loss spike, plateau, grad explosion, throughput collapse, loss rebound, ETA overrun
+    - INFO: progress milestones with ETA
+    """
+    # Initialize per-run alert state (using mutable default to persist across calls)
+    if "initialized" not in _alert_state or _alert_state.get("total_steps") != total_steps:
+        _alert_state.clear()
+        _alert_state["initialized"] = True
+        _alert_state["total_steps"] = total_steps
+        _alert_state["min_loss_seen"] = float("inf")
+        _alert_state["loss_at_500"] = None
+        _alert_state["first_loss"] = None
+        _alert_state["throughput_baseline"] = None
+        _alert_state["last_depth_change_step"] = None
+        _alert_state["loss_before_depth_change"] = None
+        _alert_state["rebound_alerted"] = False
+        _alert_state["divergence_alerted"] = False
+        _alert_state["throughput_alert_step"] = 0
+
+    # ═══════════════════════════════════════════════════════════
+    # ERROR: NaN/Inf loss — training is broken, stop immediately
+    # ═══════════════════════════════════════════════════════════
+    if math.isnan(loss) or math.isinf(loss):
+        _fire_alert(
+            "CRITICAL: NaN/Inf loss — stop this run",
+            f"Loss is {loss} at step {step}/{total_steps}. Training is unrecoverable. "
+            f"Kill this run and check: (1) learning rate too high, (2) data corruption, "
+            f"(3) numerical instability in continued fractions.",
+            "error", wandb_run,
+        )
+        return
+
+    # Track loss history
+    if _alert_state["first_loss"] is None:
+        _alert_state["first_loss"] = loss
+    loss_history.append(loss)
+    if len(loss_history) > 200:
+        loss_history.pop(0)
+    _alert_state["min_loss_seen"] = min(_alert_state["min_loss_seen"], loss)
+
+    # ═══════════════════════════════════════════════════════════
+    # ERROR: Early divergence — loss hasn't dropped by step 500
+    # Catches bad LR, broken data, misconfigured model before
+    # wasting hours. Only fire once.
+    # ═══════════════════════════════════════════════════════════
+    if step == 500 and _alert_state["first_loss"] is not None:
+        _alert_state["loss_at_500"] = loss
+        improvement = (_alert_state["first_loss"] - loss) / _alert_state["first_loss"]
+        if improvement < 0.05:  # less than 5% improvement in 500 steps
+            _fire_alert(
+                "CRITICAL: Early divergence — consider killing run",
+                f"Loss only improved {improvement*100:.1f}% in first 500 steps "
+                f"({_alert_state['first_loss']:.4f} -> {loss:.4f}). "
+                f"Expected >20% drop by now. Check LR, data, or model config.",
+                "error", wandb_run,
+            )
+            _alert_state["divergence_alerted"] = True
+
+    # ═══════════════════════════════════════════════════════════
+    # ERROR: Loss rebounding — loss consistently rising after
+    # initial decrease. Run is likely doomed.
+    # ═══════════════════════════════════════════════════════════
+    if (step > warmup_steps * 2 and len(loss_history) >= 100
+            and not _alert_state["rebound_alerted"]):
+        recent_50 = sum(loss_history[-50:]) / 50
+        older_50 = sum(loss_history[-100:-50]) / 50
+        if recent_50 > older_50 * 1.15:  # 15% worse over 100 steps
+            _fire_alert(
+                "CRITICAL: Loss rebounding — training going backwards",
+                f"Recent loss avg ({recent_50:.4f}) is {(recent_50/older_50 - 1)*100:.1f}% "
+                f"higher than 50 steps ago ({older_50:.4f}) at step {step}. "
+                f"Training is diverging. Consider stopping and reducing LR.",
+                "error", wandb_run,
+            )
+            _alert_state["rebound_alerted"] = True
+
+    # ═══════════════════════════════════════════════════════════
+    # WARN: Loss spike — sudden 3x jump over recent average
+    # ═══════════════════════════════════════════════════════════
+    if step > warmup_steps and len(loss_history) > 50:
+        recent_avg = sum(loss_history[-50:-1]) / 49
+        if recent_avg > 0 and loss > recent_avg * 3:
+            _fire_alert(
+                "Loss spike detected",
+                f"Loss {loss:.4f} is {loss/recent_avg:.1f}x the recent average "
+                f"({recent_avg:.4f}) at step {step}. Single spikes are usually OK; "
+                f"sustained increases mean trouble.",
+                "warn", wandb_run,
+            )
+
+    # ═══════════════════════════════════════════════════════════
+    # WARN: Loss plateau — truly stuck (no improvement over 500 steps)
+    # Only fires in first 80% of training (cosine decay naturally slows late)
+    # ═══════════════════════════════════════════════════════════
+    if (step > warmup_steps * 3 and step < total_steps * 0.8
+            and len(loss_history) >= 100):
+        old_avg = sum(loss_history[:50]) / 50
+        new_avg = sum(loss_history[-50:]) / 50
+        # Loss must be INCREASING or truly flat (< 0.01% improvement)
+        if old_avg > 0 and new_avg >= old_avg * 0.9999:
+            plateau_key = f"plateau_{step // 2000}"  # at most once per 2000 steps
+            if plateau_key not in _alert_state:
+                _alert_state[plateau_key] = True
+                _fire_alert(
+                    "Loss plateau — model may be stuck",
+                    f"Loss flat/increasing over last 100 steps: {old_avg:.4f} -> "
+                    f"{new_avg:.4f} ({(old_avg-new_avg)/old_avg*100:.2f}%). "
+                    f"If this persists, the learning rate may be too low.",
+                    "warn", wandb_run,
+                )
+
+    # ═══════════════════════════════════════════════════════════
+    # WARN: Gradient explosion — grad norm way above clip threshold
+    # ═══════════════════════════════════════════════════════════
+    if grad_norm > 10.0 and step > warmup_steps:
+        _fire_alert(
+            "Gradient explosion",
+            f"Gradient norm {grad_norm:.2f} at step {step} (10x above clip threshold). "
+            f"This can precede loss divergence. Monitor closely.",
+            "warn", wandb_run,
+        )
+
+    # ═══════════════════════════════════════════════════════════
+    # WARN: ETA exceeds expected training time
+    # Our GPU cluster time is limited — alert if we're too slow.
+    # ═══════════════════════════════════════════════════════════
+    if t0 is not None and step > 0 and step % 1000 == 0:
+        elapsed_h = (time.time() - t0) / 3600
+        total_eta_h = elapsed_h * total_steps / step
+        remaining_h = total_eta_h - elapsed_h
+        # Alert if training will take >7 days (168h) — beyond reasonable cluster time
+        if total_eta_h > 168:
+            _fire_alert(
+                "ETA exceeds cluster time budget",
+                f"At current pace, training will take {total_eta_h:.1f}h total "
+                f"({remaining_h:.1f}h remaining). Step {step}/{total_steps}, "
+                f"{elapsed_h:.1f}h elapsed. Consider reducing total_steps or "
+                f"increasing batch size to speed up.",
+                "warn", wandb_run,
+            )
+
+    # ═══════════════════════════════════════════════════════════
+    # INFO: Progress milestones with ETA (every 10%)
+    # More granular than 25% for multi-day runs
+    # ═══════════════════════════════════════════════════════════
+    milestones = {int(total_steps * p): f"{int(p*100)}%"
+                  for p in [0.10, 0.25, 0.50, 0.75, 0.90]}
+    if step in milestones:
+        elapsed_h = (time.time() - t0) / 3600 if t0 else 0
+        remaining_h = elapsed_h * (total_steps - step) / step if step > 0 else 0
+        ppl = math.exp(min(loss, 20))
+        _fire_alert(
+            f"Training {milestones[step]} complete",
+            f"Step {step}/{total_steps}, loss {loss:.4f}, ppl {ppl:.1f}, "
+            f"elapsed {elapsed_h:.1f}h, est. remaining {remaining_h:.1f}h",
+            "info", wandb_run,
+        )
+
+
+def _check_val_loss_alert(step, val_loss, prev_val_loss, wandb_run):
+    """Alert on validation loss regression."""
+    if prev_val_loss is not None:
+        if val_loss > prev_val_loss * 1.1:
+            _fire_alert(
+                "Validation loss regression",
+                f"Val loss increased from {prev_val_loss:.4f} to {val_loss:.4f} "
+                f"(+{(val_loss-prev_val_loss)/prev_val_loss*100:.1f}%) at step {step}. "
+                f"If this persists across multiple evals, the model may be overfitting.",
+                "warn", wandb_run,
+            )
+        # Also alert on first good val loss
+        if prev_val_loss is not None and val_loss < prev_val_loss * 0.95:
+            ppl = math.exp(min(val_loss, 20))
+            _fire_alert(
+                "Validation improving",
+                f"Val loss improved from {prev_val_loss:.4f} to {val_loss:.4f} "
+                f"(-{(1 - val_loss/prev_val_loss)*100:.1f}%), ppl {ppl:.1f} at step {step}",
+                "info", wandb_run,
+            )
+
+
+def load_experiment_config(config_path, args, parser=None):
     """Load experiment config from YAML. CLI args take precedence over YAML values.
-    Only sets values that are None (not explicitly provided on CLI).
+    Uses parser defaults to detect which args were explicitly set on the CLI.
     """
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
+    # Determine parser defaults so we can distinguish "user passed --total_steps 500"
+    # from "total_steps has its argparse default of 19073"
+    defaults = vars(parser.parse_args([])) if parser else {}
     for key, value in cfg.items():
-        if hasattr(args, key) and getattr(args, key) is None:
-            setattr(args, key, value)
+        if not hasattr(args, key):
+            continue
+        current = getattr(args, key)
+        # Override if: no parser (legacy), value is None, or value matches the default
+        if parser is None:
+            if current is None:
+                setattr(args, key, value)
+        else:
+            if current is None or current == defaults.get(key):
+                setattr(args, key, value)
     return args
 
 
@@ -489,6 +800,10 @@ def add_training_args(parser):
     parser.add_argument("--wandb_project", type=str, default="cofrgenet-f")
     parser.add_argument("--wandb_run_name", type=str, default=None)
     parser.add_argument("--no_wandb", action="store_true")
+    parser.add_argument("--trackio_space", type=str, default="cahlen/cofrgenet-f-trackio",
+                        help="HuggingFace Space ID for trackio dashboard")
+    parser.add_argument("--trackio_group", type=str, default=None,
+                        help="Group name for trackio (e.g., 'pair1', 'pair3') — groups baseline+cofrgenet together")
     parser.add_argument("--resume", action="store_true",
                         help="Resume from latest checkpoint in checkpoint_dir")
     parser.add_argument("--config", type=str, default=None,

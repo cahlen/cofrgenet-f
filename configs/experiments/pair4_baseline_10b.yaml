@@ -1,0 +1,15 @@
+# Pair 4: 9.9B Baseline — deep + wide scaling point
+n_layer: 48
+n_embd: 4096
+n_head: 32
+block_size: 1024
+total_steps: 190734   # 100B tokens / 524288 batch_tokens
+warmup_steps: 2000
+lr: 2.0e-4
+weight_decay: 0.1
+batch_tokens: 524288
+micro_batch_size: 2
+checkpoint_dir: checkpoints/pair4-baseline-10b
+save_interval: 5000
+eval_interval: 1000
+trackio_group: pair4-10b
