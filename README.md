@@ -1,10 +1,16 @@
 # CoFrGeNet-F: Continued Fraction Language Model
 
-An open-source implementation of **CoFrGeNet-F**, a continued fraction architecture that replaces Transformer FFN layers with continued fraction networks, achieving 34% parameter reduction.
+The first independent, large-scale replication of **CoFrGeNet-F** — a continued fraction architecture that replaces Transformer FFN layers with continued fraction networks. Training matched pairs from **450M to 13B parameters** on **50–100B tokens** to test IBM Research's claim that the architecture's advantage grows with scale.
 
-Based on IBM Research's paper: [CoFrGeNet: Continued Fraction Architectures for Language Generation](https://arxiv.org/abs/2601.21766) (arXiv:2601.21766, January 2026). Implemented from the paper's mathematics.
+Based on: [CoFrGeNet: Continued Fraction Architectures for Language Generation](https://arxiv.org/abs/2601.21766) (arXiv:2601.21766, IBM Research, January 2026). Implemented from the paper's mathematics.
 
-## What Is This?
+## Why This Matters
+
+IBM's paper showed CoFrGeNet-F achieving comparable perplexity with **35% fewer parameters** at GPT-2 XL scale (~985M vs ~1.5B), claiming the advantage grows with model size. But their largest experiment was ~1.5B parameters on ~26B tokens. **Nobody has publicly validated whether this scaling claim holds at larger scales.**
+
+We're running that experiment — training matched pairs of standard Transformers and CoFrGeNet-F models from 450M to 13B parameters, on identical data, with identical hyperparameters. The only difference: the FFN layer.
+
+## What Is CoFrGeNet-F?
 
 Standard Transformers use Multi-Head Attention + Feed-Forward Networks (FFN). CoFrGeNet-F keeps standard attention but replaces the FFN with a **Continued Fraction FFN (Cffn)** — an ensemble of continued fraction "ladders" that compute rational functions via continuant polynomials:
 
@@ -24,159 +30,83 @@ $$
 \tilde{f} = \frac{K_{d-1}}{K_d}
 $$
 
-This replaces the standard 2-layer FFN (Linear → GELU → Linear) with a **rational function** that is strictly more expressive per parameter. Rational functions approximate a broader class of functions than polynomials with the same parameter count — achieving **~4× fewer parameters per FFN layer**.
+This replaces the standard 2-layer FFN (Linear → GELU → Linear) with a **rational function** that is strictly more expressive per parameter — achieving **~4× fewer parameters per FFN layer**.
 
-## Experiments
+## Paired Experiments (DGX B200)
 
-All models are trained on [FineWeb-Edu 10BT](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu) (~10 billion tokens) with identical hyperparameters and the same dyadic training schedule. All evaluations use the same code on the same hardware.
+All experiments run on **8× NVIDIA B200 GPUs** (179 GB VRAM each) using DDP. Each pair trains a standard Transformer baseline and a CoFrGeNet-F model on **identical data, identical hyperparameters, identical hardware**. The only variable is the FFN layer.
 
-### Experiment 1: Parameter-Efficient (82M vs 124M)
+### Pair 1: 450M vs 410M (50B tokens) — In Progress
 
-**Question:** Can CoFrGeNet-F match baseline quality with 34% fewer parameters?
+Sanity check at small scale. Validates the multi-GPU pipeline.
 
-| Model | Config | Parameters |
-|-------|--------|-----------|
-| **Baseline** | 12L, 768d, 12h, standard FFN | 124.3M |
-| **CoFrGeNet-F** | 12L, 768d, 12h, Cffn (L=3, d=5) | 82.0M (34% fewer) |
+| | Baseline | CoFrGeNet-F |
+|-|----------|-------------|
+| **Parameters** | ~450M | ~410M |
+| **Architecture** | 12L, 1600d, 25h, standard FFN | 12L, 2048d, 16h, Cffn (L=3, d=5) |
+| **Data** | 50B tokens (95,367 steps) | 50B tokens (95,367 steps) |
 
-| Metric | Baseline (124M) | CoFrGeNet-F (82M) | Note |
-|--------|-----------------|-------------------|------|
-| WikiText-2 PPL | **40.79** | 110.32 | lower is better |
-| WikiText-103 PPL | **40.79** | 110.32 | lower is better |
-| LAMBADA PPL | **37.45** | 166.57 | lower is better |
-| LAMBADA Accuracy | **19.06%** | 8.77% | higher is better |
-| Throughput | **277,827** tok/s | 103,455 tok/s | |
-| Generation Speed | **5.53** ms/tok | 10.92 ms/tok | |
+**Baseline:** Complete. Final loss 2.67, val loss 2.68, ~2.12M tok/s, ~3.5 hours.
+**CoFrGeNet-F:** Training. ~27% complete, loss 3.58, ~800K tok/s.
 
-**Result:** At GPT-2 Small scale, CoFrGeNet-F does not match the baseline with fewer parameters. The paper's strongest results were at GPT-2 XL scale (985M CoFrGeNet-F vs 1.5B baseline), suggesting the architecture benefits from larger scale.
+### Pair 3: 7.5B vs 4.8B (100B tokens) — Planned
 
-### Experiment 2: Iso-Parameter (128M vs 124M) — Complete
+Key experiment — **7× beyond the IBM paper's largest scale**. Tests the central claim.
 
-**Question:** With equal parameter budget, does CoFrGeNet-F match or beat the baseline?
+| | Baseline | CoFrGeNet-F |
+|-|----------|-------------|
+| **Parameters** | ~7.5B | ~4.8B (35% fewer) |
+| **Architecture** | 36L, 4096d, 32h, standard FFN | 36L, 4608d, 36h, Cffn (L=3, d=5) |
 
-| Model | Config | Parameters |
-|-------|--------|-----------|
-| **Baseline** | 12L, 768d, 12h, standard FFN | 124.3M |
-| **CoFrGeNet-F** | 12L, 1024d, 16h, Cffn (L=3, d=5) | 128.3M |
+### Pair 4: 9.9B vs 7.8B (100B tokens) — Planned
 
-By widening the hidden dimension from 768 to 1024, the CoFrGeNet-F model reaches ~128M parameters — matching the baseline. This isolates the architectural question: at equal parameter count, which FFN design produces better language modeling?
+Deep + wide. Tests 48 layers and more ladders (L=5).
 
-**Result:** Significant improvement over Experiment 1, but baseline still wins.
+| | Baseline | CoFrGeNet-F |
+|-|----------|-------------|
+| **Parameters** | ~9.9B | ~7.8B |
+| **Architecture** | 48L, 4096d, 32h, standard FFN | 48L, 5120d, 40h, Cffn (L=5, d=5) |
 
-| Metric | Baseline (124M) | CoFrGeNet-F (128M) | |
-|--------|:---------------:|:-----------------:|---|
-| WikiText-2 PPL | **40.79** | 82.46 | lower is better |
-| WikiText-103 PPL | **40.79** | 82.46 | lower is better |
-| LAMBADA PPL | **37.45** | 111.26 | lower is better |
-| LAMBADA Acc | **19.06%** | 11.41% | higher is better |
-| Throughput | **452,622** tok/s | 128,206 tok/s | |
-| Gen Speed | **3.68** ms/tok | 10.50 ms/tok | |
+### Pair 5: 12.9B vs 7.9B (100B tokens) — Planned
 
-Trained on H200 with `torch.compile` (~114K tok/s, 24.3 hours). The improvement from 82M→128M (WikiText-2 PPL 110→82) suggests the architecture benefits from scale, consistent with the paper's strongest results at GPT-2 XL scale (985M params).
+Push scale. 38% fewer parameters. Deeper continued fractions (d=7).
 
-### Experiment 3: More Ladders (128M, L=8) — In Progress
+| | Baseline | CoFrGeNet-F |
+|-|----------|-------------|
+| **Parameters** | ~12.9B | ~7.9B (38% fewer) |
+| **Architecture** | 40L, 5120d, 40h, standard FFN | 40L, 5632d, 44h, Cffn (L=5, d=7) |
 
-**Question:** Does increasing from 3 to 8 continued fraction ladders improve quality?
+See [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md) for the full experiment plan, gradient stability research, and evaluation methodology.
 
-Each ladder is an independent rational approximation of the input. More ladders give a richer function space at negligible parameter cost (+0.3%). This tests whether the Cffn's expressiveness is limited by having too few ladders.
+## Prior Experiments (Single-GPU)
 
-| Model | Config | Parameters |
-|-------|--------|-----------|
-| **CoFrGeNet-F (Exp 2)** | 12L, 1024d, 16h, Cffn (L=3, d=5) | 128.3M |
-| **CoFrGeNet-F (Exp 3)** | 12L, 1024d, 16h, Cffn (L=8, d=5) | 128.6M |
+Before the DGX B200 paired runs, three smaller experiments were conducted on single GPUs (RTX 5090 / H200) training on 10B tokens:
 
-Training on H200, ETA ~March 10, 2026.
+| Experiment | Baseline | CoFrGeNet-F | WikiText-2 PPL | Result |
+|-----------|----------|-------------|:-:|--------|
+| **Exp 1** (param-efficient) | 124M | 82M (34% fewer) | 40.79 vs 110.32 | CoFrGeNet-F significantly worse |
+| **Exp 2** (iso-parameter) | 124M | 128M | 40.79 vs 82.46 | Better, but baseline still wins |
+| **Exp 3** (more ladders, L=8) | — | 128M | — | Completed, evaluating |
 
-### HuggingFace
+These results at small scale are consistent with the IBM paper, which showed CoFrGeNet-F's advantage only emerging at GPT-2 XL scale (~1B params). The paired experiments above test whether that trend continues.
 
-Model weights are on HuggingFace: [cahlen/cofrgenet-f](https://huggingface.co/cahlen/cofrgenet-f).
+Model weights for Exp 1 and 2 are on HuggingFace: [cahlen/cofrgenet-f](https://huggingface.co/cahlen/cofrgenet-f).
 
-## Project Status
+## Gradient Stability Research
 
-- [x] Core architecture: continuant computation, Cffn layer, full CoFrGeNet-F model
-- [x] Baseline Transformer (GPT-2 Small)
-- [x] Data pipeline (FineWeb-Edu 10BT tokenized to binary shards)
-- [x] Training infrastructure (shared training loop, dyadic schedule)
-- [x] Baseline model trained and evaluated
-- [x] Experiment 1: CoFrGeNet-F 82M trained and evaluated
-- [x] Head-to-head benchmark comparison
-- [x] Experiment 2: CoFrGeNet-F 128M trained and evaluated
-- [ ] **Experiment 3: CoFrGeNet-F 128M L=8 (training in progress)**
-- [ ] Interactive Gradio demo (side-by-side generation)
-- [ ] Technical write-up / blog post
-
-## Architecture Details
-
-See the **[Wiki](https://github.com/cahlen/cofrgenet-f/wiki)** for detailed documentation:
-
-- [Architecture Overview](https://github.com/cahlen/cofrgenet-f/wiki/Architecture-Overview) — Side-by-side comparison of standard Transformer vs CoFrGeNet-F
-- [Continued Fractions and Continuants](https://github.com/cahlen/cofrgenet-f/wiki/Continued-Fractions-and-Continuants) — The mathematics from first principles
-- [The Cffn Layer](https://github.com/cahlen/cofrgenet-f/wiki/The-Cffn-Layer) — Full code walkthrough mapped to math
-- [Custom Autograd](https://github.com/cahlen/cofrgenet-f/wiki/Custom-Autograd) — Gradient derivation and implementation
-- [Dyadic Training Schedule](https://github.com/cahlen/cofrgenet-f/wiki/Dyadic-Training-Schedule) — The critical progressive unfreezing schedule
-- [Parameter Efficiency](https://github.com/cahlen/cofrgenet-f/wiki/Parameter-Efficiency) — Layer-by-layer parameter breakdown
-
-## The Cffn Layer
-
-Each **Continued Fraction FFN (Cffn)** replaces the standard two-layer FFN. Where a standard Transformer block uses Linear → GELU → Linear with a 4× expansion, the Cffn instead computes:
-
-$$
-y = U x + \sum_{j=1}^{L} V_j \cdot z_j
-$$
-
-The components are:
-
-**Direct linear path** — a skip connection through the fraction block:
-
-$$
-U \in \mathbb{R}^{p \times p}
-$$
-
-**Gating projection** — modulates the input before it enters the ladders:
-
-$$
-\hat{x} = \sigma(G x) \odot x, \qquad G \in \mathbb{R}^{p \times p}
-$$
-
-**Continued fraction ladders** — each ladder computes p independent continued fractions element-wise:
-
-$$
-z_j = \tilde{f}\!\left( \hat{x} \odot W^{(j)} \right), \qquad W^{(j)} \in \mathbb{R}^{p \times d}, \quad j = 1, \ldots, L
-$$
-
-**Combination weights** — per-dimension weighting of ladder outputs:
-
-$$
-V \in \mathbb{R}^{p \times L}
-$$
-
-### Efficient Gradients (Proposition 1)
-
-The continuant formulation yields gradients that require only **one division** instead of d:
+During training, CoFrGeNet-F exhibits **elevated gradient norms** (22–28× the baseline) due to poles in the continued fraction's rational function. The gradient formula:
 
 $$
 \frac{\partial \tilde{f}}{\partial a_k} = (-1)^{k} \left( \frac{K_{d-k}}{K_d} \right)^{2}
 $$
 
-By caching the reciprocal of the final continuant and reusing it across all depth levels, the cost drops from O(d) divisions to O(1).
+explodes when the denominator continuant $K_d$ approaches zero. We've identified several stabilization approaches for post-experiment testing, including **log-space continuant computation** and **adaptive gradient clipping (AGC)**.
 
-### Pole Avoidance
+This work connects to prior research on the structural properties of continued fraction convergents:
 
-Continued fractions can encounter poles when the denominator vanishes. We apply safe clamping:
+> **Humphreys, C.** "Prime Numbers and the Convergents of a Continued Fraction." NCUR, 2013. ([PDF](docs/Humphreys_2013_Convergents_of_Continued_Fractions.pdf))
 
-$$
-K_d^{\text{safe}} = \text{sign}(K_d) \cdot \max\!\left( |K_d|, \; \epsilon \right), \qquad \epsilon = 0.01
-$$
-
-### Parameter Count per Cffn Layer
-
-Each Cffn layer uses:
-
-$$
-2p^2 + L \cdot p \cdot d + L \cdot p = 2 \times 768^2 + 3 \times 768 \times 5 + 3 \times 768 = 1{,}193{,}472 \text{ params}
-$$
-
-A standard FFN uses 4,718,592 params — a **3.95× reduction** per layer.
+The continuant recurrence in that paper ($A_n = a_n A_{n-1} + A_{n-2}$) is identical to CoFrGeNet-F's computation. Theorem 3.5 (reciprocal symmetry of convergents) provides a theoretical basis for principled pole-aware gradient damping. See [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md) Section 7 for the full analysis.
 
 ## Quick Start
 
@@ -185,17 +115,36 @@ git clone https://github.com/cahlen/cofrgenet-f.git
 cd cofrgenet-f
 pip install -r requirements.txt
 
-# Download and tokenize data
+# Download and tokenize data (default: 10B tokens)
 python scripts/01_download_data.py
 
-# Train baseline
+# Train baseline (single GPU)
 python scripts/02_train_baseline.py
 
-# Train CoFrGeNet-F (with dyadic schedule)
+# Train CoFrGeNet-F (single GPU, with dyadic schedule)
 python scripts/03_train_cofrgenet.py
 
 # Evaluate both models
 python scripts/04_evaluate.py --model both
+```
+
+### Multi-GPU Training (DDP)
+
+```bash
+# Using experiment configs on 8 GPUs
+bash scripts/launch_training.sh scripts/02_train_baseline.py \
+  --config configs/experiments/pair1_baseline_450m.yaml
+
+bash scripts/launch_training.sh scripts/03_train_cofrgenet.py \
+  --config configs/experiments/pair1_cofrgenet_410m.yaml
+```
+
+### Unattended Training with Auto-Restart
+
+```bash
+# Automatically resumes from latest checkpoint on crash (up to 20 retries)
+bash scripts/train_with_autorestart.sh scripts/03_train_cofrgenet.py \
+  --config configs/experiments/pair1_cofrgenet_410m.yaml
 ```
 
 ### Docker
@@ -210,20 +159,21 @@ docker run --gpus all \
 
 ## Training Details
 
-| Hyperparameter | Value |
-|---------------|-------|
-| Dataset | FineWeb-Edu sample-10BT (~10B tokens) |
-| Tokenizer | GPT-2 (tiktoken) |
-| Optimizer | AdamW |
-| Learning rate | 6e-4 peak, cosine decay to 0 |
-| Warmup | 700 steps |
-| Weight decay | 0.1 |
-| Betas | (0.9, 0.95) |
-| Gradient clipping | 1.0 max norm |
-| Batch size | 524,288 tokens per update |
-| Total steps | 19,073 (one epoch) |
-| Precision | bfloat16 |
-| torch.compile | Used for 128M experiment (~2.3x throughput) |
+### Paired Experiments (DGX B200)
+
+| Hyperparameter | Pair 1 (50B tok) | Pairs 3–5 (100B tok) |
+|---------------|:-:|:-:|
+| Dataset | FineWeb-Edu | FineWeb-Edu |
+| Tokenizer | GPT-2 (tiktoken, vocab 50,257) | GPT-2 |
+| Optimizer | AdamW (fused), β₁=0.9, β₂=0.95 | AdamW (fused) |
+| Learning rate | 6e-4, cosine → 0 | 1.5–3e-4, cosine → 0 |
+| Warmup | 700 steps | 2,000 steps |
+| Weight decay | 0.1 | 0.1 |
+| Gradient clipping | 1.0 max norm | 1.0 max norm |
+| Batch size | 524,288 tokens/update | 524,288 tokens/update |
+| Precision | bfloat16 | bfloat16 |
+| Parallelism | DDP (8× B200) | DDP / FSDP (8× B200) |
+| torch.compile | max-autotune | max-autotune |
 
 CoFrGeNet-F additionally uses a **dyadic training schedule** that progressively unfreezes continued fraction depth levels — without this, the paper reports 10–80% performance degradation:
 
@@ -231,22 +181,64 @@ $$
 s_i = \left(1 - \frac{1}{2^i}\right) \times S_{\text{total}}
 $$
 
-| Depth | Unfreeze Step | % of Training |
-|-------|--------------|---------------|
-| 0 (linear components U, G, V) | 0 | 0% |
-| 1 (ladder column 0) | 9,537 | 50% |
-| 2 (ladder column 1) | 14,305 | 75% |
-| 3 (ladder column 2) | 16,689 | 87.5% |
-| 4 (ladder column 3) | 17,881 | 93.75% |
-| 5 (ladder column 4) | 18,477 | 96.875% |
+## The Cffn Layer
+
+Each **Continued Fraction FFN (Cffn)** replaces the standard two-layer FFN. Where a standard Transformer block uses Linear → GELU → Linear with a 4× expansion, the Cffn computes:
+
+$$
+y = U x + \sum_{j=1}^{L} V_j \cdot z_j
+$$
+
+**Direct linear path** — skip connection: $U \in \mathbb{R}^{p \times p}$
+
+**Gating projection** — modulates input before the ladders: $\hat{x} = \sigma(G x) \odot x$
+
+**Continued fraction ladders** — each computes $p$ independent continued fractions element-wise:
+
+$$
+z_j = \tilde{f}\!\left( \hat{x} \odot W^{(j)} \right), \qquad W^{(j)} \in \mathbb{R}^{p \times d}, \quad j = 1, \ldots, L
+$$
+
+**Combination weights** — per-dimension weighting: $V \in \mathbb{R}^{p \times L}$
+
+## Architecture Details
+
+See the **[Wiki](https://github.com/cahlen/cofrgenet-f/wiki)** for detailed documentation:
+
+- [Architecture Overview](https://github.com/cahlen/cofrgenet-f/wiki/Architecture-Overview) — Side-by-side comparison of standard Transformer vs CoFrGeNet-F
+- [Continued Fractions and Continuants](https://github.com/cahlen/cofrgenet-f/wiki/Continued-Fractions-and-Continuants) — The mathematics from first principles
+- [The Cffn Layer](https://github.com/cahlen/cofrgenet-f/wiki/The-Cffn-Layer) — Full code walkthrough mapped to math
+- [Custom Autograd](https://github.com/cahlen/cofrgenet-f/wiki/Custom-Autograd) — Gradient derivation and implementation
+- [Dyadic Training Schedule](https://github.com/cahlen/cofrgenet-f/wiki/Dyadic-Training-Schedule) — The critical progressive unfreezing schedule
+- [Parameter Efficiency](https://github.com/cahlen/cofrgenet-f/wiki/Parameter-Efficiency) — Layer-by-layer parameter breakdown
+
+## Project Status
+
+- [x] Core architecture (continuant, Cffn, both models, configs, tests)
+- [x] Data pipeline (FineWeb-Edu tokenized to binary shards)
+- [x] Training infrastructure (DDP, auto-restart, dyadic schedule, YAML configs)
+- [x] Prior experiments 1–3 (single-GPU, 10B tokens)
+- [x] Evaluation script (WikiText-2/103, LAMBADA, throughput)
+- [x] HuggingFace model weights ([cahlen/cofrgenet-f](https://huggingface.co/cahlen/cofrgenet-f))
+- [x] GitHub Wiki (7 pages of architecture + math documentation)
+- [x] Pair 1 baseline (450M) trained
+- [ ] **Pair 1 CoFrGeNet-F (410M) — training in progress**
+- [ ] Pairs 3–5 (7B–13B scale, 100B tokens)
+- [ ] Gradient stabilization experiments (post-pair training)
+- [ ] Interactive Gradio demo (side-by-side generation)
+- [ ] Technical write-up / blog post
 
 ## References
 
-- [CoFrGeNet paper (arXiv:2601.21766)](https://arxiv.org/abs/2601.21766) — IBM Research, January 2026
-- [CoFrNet (NeurIPS 2021)](https://arxiv.org/abs/2506.05586) — Predecessor for tabular/classification tasks
-- [CoFrNet in AIX360](https://github.com/Trusted-AI/AIX360/tree/master/examples/cofrnet) — IBM's reference implementation of CoFrNet
-- [FineWeb-Edu](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu) — Training dataset
-- [nanoGPT](https://github.com/karpathy/nanoGPT) — Architecture reference
+1. [CoFrGeNet paper (arXiv:2601.21766)](https://arxiv.org/abs/2601.21766) — IBM Research, January 2026
+2. [CoFrNet (NeurIPS 2021)](https://arxiv.org/abs/2506.05586) — Predecessor for tabular/classification tasks
+3. [Humphreys, C. "Prime Numbers and the Convergents of a Continued Fraction." NCUR, 2013](docs/Humphreys_2013_Convergents_of_Continued_Fractions.pdf) — Continuant theory applied to gradient stability
+4. [FineWeb-Edu](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu) — Training dataset
+5. [nanoGPT](https://github.com/karpathy/nanoGPT) — Architecture reference
+
+## IBM Patent Note
+
+IBM has US Patent Application #20230401438 on CoFrNets. The paper itself is CC BY 4.0. This implementation is from-scratch based on published mathematics. This is an academic reproduction / educational project.
 
 ## License
 
