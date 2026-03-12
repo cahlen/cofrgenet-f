@@ -33,7 +33,7 @@ while [ "$restart_count" -lt "$MAX_RESTARTS" ]; do
     echo "════════════════════════════════════════════════════════════"
 
     # Always pass --resume so it picks up from latest checkpoint if available
-    DATA_DIR="$DATA_DIR" ./scripts/launch_training.sh "$MODEL_TYPE" --resume "$@"
+    DATA_DIR="$DATA_DIR" CUDA_DEVICES="${CUDA_DEVICES:-}" ./scripts/launch_training.sh "$MODEL_TYPE" --resume "$@"
     exit_code=$?
 
     # Exit code 0 = training completed normally
@@ -53,11 +53,23 @@ while [ "$restart_count" -lt "$MAX_RESTARTS" ]; do
     # Wait for GPUs to fully release memory
     sleep "$RESTART_DELAY"
 
-    # Verify GPUs are free before restarting
-    gpu_procs=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | wc -l)
-    if [ "$gpu_procs" -gt 0 ]; then
-        echo "[WARN] $gpu_procs GPU processes still running, waiting 30s more..."
-        sleep 30
+    # Verify our GPUs are free before restarting
+    if [ -n "${CUDA_DEVICES:-}" ]; then
+        # Only check our assigned GPUs
+        for gpu_id in $(echo "$CUDA_DEVICES" | tr ',' ' '); do
+            gpu_procs=$(nvidia-smi -i "$gpu_id" --query-compute-apps=pid --format=csv,noheader 2>/dev/null | wc -l)
+            if [ "$gpu_procs" -gt 0 ]; then
+                echo "[WARN] GPU $gpu_id still has $gpu_procs processes, waiting 30s more..."
+                sleep 30
+                break
+            fi
+        done
+    else
+        gpu_procs=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | wc -l)
+        if [ "$gpu_procs" -gt 0 ]; then
+            echo "[WARN] $gpu_procs GPU processes still running, waiting 30s more..."
+            sleep 30
+        fi
     fi
 done
 

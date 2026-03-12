@@ -66,16 +66,22 @@ def main():
     if args.cf_depth is not None:
         config_kwargs["cf_depth"] = args.cf_depth
     config = CoFrGeNetConfig(**config_kwargs)
-    model = CoFrGeNetTransformer(config).to(device)
+    model = CoFrGeNetTransformer(config)
     total_params = sum(p.numel() for p in model.parameters())
     if rank == 0:
         print(f"CoFrGeNet-F Transformer: {total_params:,} parameters")
         print(f"Cffn config: L={config.num_ladders} ladders, d={config.cf_depth} depth")
 
-    # FSDP wrapping (before torch.compile and optimizer)
-    use_grad_ckpt = total_params > 5_000_000_000
+    # Distributed wrapping (before torch.compile and optimizer)
+    # For models that fit on one GPU (<2B), uses DDP with .to(device) first
+    # For larger models, uses FSDP which handles device placement
+    use_grad_ckpt = total_params > 2_000_000_000
     if world_size > 1:
+        if total_params < 2_000_000_000:
+            model = model.to(device)
         model = wrap_model_fsdp(model, device, use_gradient_checkpointing=use_grad_ckpt)
+    else:
+        model = model.to(device)
 
     # Data — account for world_size: each GPU processes micro_batch_size independently
     grad_accum_steps = max(1, args.batch_tokens // (args.micro_batch_size * args.block_size * world_size))

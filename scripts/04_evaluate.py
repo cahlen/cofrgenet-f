@@ -42,11 +42,18 @@ def load_model(model_type, checkpoint_path, device, config_overrides=None):
         model = CoFrGeNetTransformer(config)
 
     state_dict = load_file(checkpoint_path)
-    # torch.compile adds _orig_mod. prefix to keys — strip it if present
+    # Strip torch.compile (_orig_mod.) and DDP (module.) prefixes
     cleaned = {}
     for k, v in state_dict.items():
-        cleaned[k.removeprefix("_orig_mod.")] = v
-    model.load_state_dict(cleaned, strict=False)  # lm_head tied to tok_emb
+        clean_k = k.removeprefix("_orig_mod.").removeprefix("module.")
+        cleaned[clean_k] = v
+    # strict=False because lm_head.weight is tied to tok_emb.weight
+    info = model.load_state_dict(cleaned, strict=False)
+    if info.unexpected_keys:
+        print(f"  WARNING: unexpected keys: {info.unexpected_keys[:5]}")
+    missing_non_tied = [k for k in info.missing_keys if "lm_head" not in k]
+    if missing_non_tied:
+        print(f"  WARNING: missing keys (non-tied): {missing_non_tied[:5]}")
     model = model.to(device)
     model.eval()
 

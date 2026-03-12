@@ -1,19 +1,22 @@
 # Pair 3: 4.8B CoFrGeNet-F — key experiment, largest CF model ever
 # Wider hidden dim to compensate for Cffn's smaller FFN replacement
 # 35% fewer params than 7.5B baseline (matches paper's ratio)
+# Sequential on 8 GPUs (FSDP), after baseline completes
 n_layer: 36
 n_embd: 4608
 n_head: 36
 num_ladders: 3
 cf_depth: 5
 block_size: 1024
-total_steps: 190734   # 100B tokens / 524288 batch_tokens
+total_steps: 95367    # 50B tokens / 524288 batch_tokens
 warmup_steps: 2000
 lr: 3.0e-4
 weight_decay: 0.1
 batch_tokens: 524288
-micro_batch_size: 4
+micro_batch_size: 16
+compile: false
+data_dir: data/tokenized_50b
 checkpoint_dir: checkpoints/pair3-cofrgenet-5b
-save_interval: 5000
+save_interval: 2000
 eval_interval: 1000
 trackio_group: pair3-7b

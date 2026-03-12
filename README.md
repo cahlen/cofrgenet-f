@@ -34,9 +34,9 @@ This replaces the standard 2-layer FFN (Linear → GELU → Linear) with a **rat
 
 ## Paired Experiments (DGX B200)
 
-All experiments run on **8× NVIDIA B200 GPUs** (179 GB VRAM each) using DDP. Each pair trains a standard Transformer baseline and a CoFrGeNet-F model on **identical data, identical hyperparameters, identical hardware**. The only variable is the FFN layer.
+All experiments run on **8× NVIDIA B200 GPUs** (179 GB VRAM each). Each pair trains a standard Transformer baseline and a CoFrGeNet-F model **sequentially on the same hardware** — identical data, identical hyperparameters. The only variable is the FFN layer. Models <2B use DDP; models >=2B use FSDP FULL_SHARD.
 
-### Pair 1: 450M vs 410M (50B tokens) — In Progress
+### Pair 1: 450M vs 410M (50B tokens) — Complete
 
 Sanity check at small scale. Validates the multi-GPU pipeline.
 
@@ -46,10 +46,10 @@ Sanity check at small scale. Validates the multi-GPU pipeline.
 | **Architecture** | 12L, 1600d, 25h, standard FFN | 12L, 2048d, 16h, Cffn (L=3, d=5) |
 | **Data** | 50B tokens (95,367 steps) | 50B tokens (95,367 steps) |
 
-**Baseline:** Complete. Final loss 2.67, val loss 2.68, ~2.12M tok/s, ~3.5 hours.
-**CoFrGeNet-F:** Training. ~27% complete, loss 3.58, ~800K tok/s.
+**Baseline:** Final loss 2.67, val loss 2.68, WikiText-2 PPL 23.69, LAMBADA 26.88%. ~2.12M tok/s, ~3.5 hours.
+**CoFrGeNet-F:** WikiText-2 PPL 56.61 (2.4x worse), LAMBADA 15.51%. ~800K tok/s. Gradient norms 22-28x baseline.
 
-### Pair 3: 7.5B vs 4.8B (100B tokens) — Planned
+### Pair 3: 7.5B vs 4.8B (50B tokens) — In Progress
 
 Key experiment — **7× beyond the IBM paper's largest scale**. Tests the central claim.
 
@@ -57,24 +57,17 @@ Key experiment — **7× beyond the IBM paper's largest scale**. Tests the centr
 |-|----------|-------------|
 | **Parameters** | ~7.5B | ~4.8B (35% fewer) |
 | **Architecture** | 36L, 4096d, 32h, standard FFN | 36L, 4608d, 36h, Cffn (L=3, d=5) |
+| **Data** | 50B tokens (95,367 steps) | 50B tokens (95,367 steps) |
+| **Parallelism** | DDP (8 GPUs) | FSDP (8 GPUs) + gradient checkpointing |
 
-### Pair 4: 9.9B vs 7.8B (100B tokens) — Planned
+Baseline training at ~127K tok/s. CoFrGeNet-F queued next. `torch.compile` disabled for both (DDP dtype crash with 7B+ models).
 
-Deep + wide. Tests 48 layers and more ladders (L=5).
+### Pairs 4–5 (Planned, contingent on cluster time)
 
-| | Baseline | CoFrGeNet-F |
-|-|----------|-------------|
-| **Parameters** | ~9.9B | ~7.8B |
-| **Architecture** | 48L, 4096d, 32h, standard FFN | 48L, 5120d, 40h, Cffn (L=5, d=5) |
-
-### Pair 5: 12.9B vs 7.9B (100B tokens) — Planned
-
-Push scale. 38% fewer parameters. Deeper continued fractions (d=7).
-
-| | Baseline | CoFrGeNet-F |
-|-|----------|-------------|
-| **Parameters** | ~12.9B | ~7.9B (38% fewer) |
-| **Architecture** | 40L, 5120d, 40h, standard FFN | 40L, 5632d, 44h, Cffn (L=5, d=7) |
+| Pair | Baseline | CoFrGeNet-F | Data |
+|------|----------|-------------|------|
+| **4** | 9.9B (48L, 4096d, 32h) | 7.8B (48L, 5120d, 40h, L=5, d=5) | 100B tokens |
+| **5** | 12.9B (40L, 5120d, 40h) | 7.9B (40L, 5632d, 44h, L=5, d=7) | 100B tokens |
 
 See [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md) for the full experiment plan, gradient stability research, and evaluation methodology.
 
@@ -128,23 +121,23 @@ python scripts/03_train_cofrgenet.py
 python scripts/04_evaluate.py --model both
 ```
 
-### Multi-GPU Training (DDP)
+### Multi-GPU Training (DDP/FSDP)
 
 ```bash
 # Using experiment configs on 8 GPUs
-bash scripts/launch_training.sh scripts/02_train_baseline.py \
-  --config configs/experiments/pair1_baseline_450m.yaml
+./scripts/launch_training.sh baseline --config configs/experiments/pair1_baseline_450m.yaml
+./scripts/launch_training.sh cofrgenet --config configs/experiments/pair1_cofrgenet_410m.yaml
 
-bash scripts/launch_training.sh scripts/03_train_cofrgenet.py \
-  --config configs/experiments/pair1_cofrgenet_410m.yaml
+# Restrict to specific GPUs
+CUDA_DEVICES=0,1,2,3 ./scripts/launch_training.sh baseline --config configs/experiments/pair3_baseline_7b.yaml
 ```
 
 ### Unattended Training with Auto-Restart
 
 ```bash
 # Automatically resumes from latest checkpoint on crash (up to 20 retries)
-bash scripts/train_with_autorestart.sh scripts/03_train_cofrgenet.py \
-  --config configs/experiments/pair1_cofrgenet_410m.yaml
+./scripts/train_with_autorestart.sh baseline --config configs/experiments/pair3_baseline_7b.yaml
+./scripts/train_with_autorestart.sh cofrgenet --config configs/experiments/pair3_cofrgenet_5b.yaml
 ```
 
 ### Docker
@@ -161,19 +154,19 @@ docker run --gpus all \
 
 ### Paired Experiments (DGX B200)
 
-| Hyperparameter | Pair 1 (50B tok) | Pairs 3–5 (100B tok) |
-|---------------|:-:|:-:|
-| Dataset | FineWeb-Edu | FineWeb-Edu |
-| Tokenizer | GPT-2 (tiktoken, vocab 50,257) | GPT-2 |
-| Optimizer | AdamW (fused), β₁=0.9, β₂=0.95 | AdamW (fused) |
-| Learning rate | 6e-4, cosine → 0 | 1.5–3e-4, cosine → 0 |
-| Warmup | 700 steps | 2,000 steps |
-| Weight decay | 0.1 | 0.1 |
-| Gradient clipping | 1.0 max norm | 1.0 max norm |
-| Batch size | 524,288 tokens/update | 524,288 tokens/update |
-| Precision | bfloat16 | bfloat16 |
-| Parallelism | DDP (8× B200) | DDP / FSDP (8× B200) |
-| torch.compile | max-autotune | max-autotune |
+| Hyperparameter | Pair 1 (50B tok) | Pair 3 (50B tok) | Pairs 4–5 (100B tok) |
+|---------------|:-:|:-:|:-:|
+| Dataset | FineWeb-Edu | FineWeb-Edu | FineWeb-Edu |
+| Tokenizer | GPT-2 (tiktoken, vocab 50,257) | GPT-2 | GPT-2 |
+| Optimizer | AdamW (fused), β₁=0.9, β₂=0.95 | AdamW (fused) | AdamW (fused) |
+| Learning rate | 6e-4, cosine → 0 | 3e-4, cosine → 0 | 1.5–2e-4, cosine → 0 |
+| Warmup | 700 steps | 2,000 steps | 2,000 steps |
+| Weight decay | 0.1 | 0.1 | 0.1 |
+| Gradient clipping | 1.0 max norm | 1.0 max norm | 1.0 max norm |
+| Batch size | 524,288 tokens/update | 524,288 tokens/update | 524,288 tokens/update |
+| Precision | bfloat16 | bfloat16 | bfloat16 |
+| Parallelism | DDP (8× B200) | DDP / FSDP (8× B200) | FSDP (8× B200) |
+| torch.compile | true (max-autotune) | false (DDP dtype crash) | TBD |
 
 CoFrGeNet-F additionally uses a **dyadic training schedule** that progressively unfreezes continued fraction depth levels — without this, the paper reports 10–80% performance degradation:
 
@@ -221,9 +214,9 @@ See the **[Wiki](https://github.com/cahlen/cofrgenet-f/wiki)** for detailed docu
 - [x] Evaluation script (WikiText-2/103, LAMBADA, throughput)
 - [x] HuggingFace model weights ([cahlen/cofrgenet-f](https://huggingface.co/cahlen/cofrgenet-f))
 - [x] GitHub Wiki (7 pages of architecture + math documentation)
-- [x] Pair 1 baseline (450M) trained
-- [ ] **Pair 1 CoFrGeNet-F (410M) — training in progress**
-- [ ] Pairs 3–5 (7B–13B scale, 100B tokens)
+- [x] Pair 1 complete (450M baseline vs 410M CoFrGeNet-F, 50B tokens)
+- [ ] **Pair 3 (7.5B baseline vs 4.8B CoFrGeNet-F, 50B tokens) — baseline training**
+- [ ] Pairs 4–5 (10B–13B scale, 100B tokens — contingent on cluster time)
 - [ ] Gradient stabilization experiments (post-pair training)
 - [ ] Interactive Gradio demo (side-by-side generation)
 - [ ] Technical write-up / blog post

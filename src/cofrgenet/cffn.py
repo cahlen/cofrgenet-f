@@ -69,7 +69,7 @@ class Cffn(nn.Module):
         if depth >= self.depth:
             return
         for w in self.ladder_weights:
-            if w.grad is not None:
+            if w.grad is not None and w.grad.dim() >= 2:
                 w.grad[:, depth:] = 0.0
 
     def forward(self, x):
@@ -90,8 +90,24 @@ class Cffn(nn.Module):
         # P-variate continued fraction ladders
         ladder_outputs = []
         for j in range(self.num_ladders):
+            w = self.ladder_weights[j]  # (p, d)
+
+            # Dyadic schedule: detach frozen depth columns so no gradients
+            # flow to them. This replaces post-backward gradient zeroing,
+            # which fails under FSDP (params are flattened to 1D shards).
+            # The forward pass still uses all depths (frozen columns contribute
+            # to output with their current values), preserving identical
+            # training dynamics to the gradient-zeroing approach.
+            if self._active_depth < self.depth:
+                if self._active_depth == 0:
+                    w = w.detach()
+                else:
+                    active = w[:, :self._active_depth]
+                    frozen = w[:, self._active_depth:].detach()
+                    w = torch.cat([active, frozen], dim=-1)
+
             # Element-wise: a[b,s,i,k] = gated_x[b,s,i] * W[i,k]
-            a = gated_x.unsqueeze(-1) * self.ladder_weights[j]  # (B,S,p,1)*(p,d) → (B,S,p,d)
+            a = gated_x.unsqueeze(-1) * w  # (B,S,p,1)*(p,d) → (B,S,p,d)
             z_j = continued_fraction(a, self.epsilon)  # (B,S,p,d) → (B,S,p)
             ladder_outputs.append(z_j)
 

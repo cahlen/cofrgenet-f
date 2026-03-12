@@ -126,9 +126,28 @@ class TestCffnFreezing:
         assert cffn.V.grad is not None
         assert cffn.gate_proj.weight.grad is not None
 
-        # All ladder columns should be zeroed
+        # All ladder weights should have no gradients (detached in forward)
         for w in cffn.ladder_weights:
-            assert w.grad.abs().sum() == 0, "All ladder grads should be zero at depth 0"
+            assert w.grad is None or w.grad.abs().sum() == 0, \
+                "All ladder grads should be None or zero at depth 0"
+
+    def test_partial_depth_freezing(self):
+        """Active depth 2: columns 0-1 get grads, columns 2-4 are frozen."""
+        p = 64
+        cffn = Cffn(dim=p, num_ladders=3, depth=5)
+        cffn.set_active_depth(2)
+
+        x = torch.randn(2, 8, p)
+        y = cffn(x)
+        loss = y.sum()
+        loss.backward()
+
+        for w in cffn.ladder_weights:
+            assert w.grad is not None, "Ladder weights should have gradients"
+            # Active columns should have non-zero gradients
+            assert w.grad[:, :2].abs().sum() > 0, "Active columns should have gradients"
+            # Frozen columns should have zero gradients (detached in forward)
+            assert w.grad[:, 2:].abs().sum() == 0, "Frozen columns should have zero gradients"
 
     def test_unfrozen_all(self):
         """With max depth, all parameters should get gradients."""

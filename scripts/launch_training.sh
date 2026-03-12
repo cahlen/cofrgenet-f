@@ -6,8 +6,9 @@
 #   ./scripts/launch_training.sh baseline --config configs/experiments/phase1_baseline_1.5b.yaml
 #
 # Environment variables:
-#   NPROC     - Number of GPUs (default: 8)
-#   DATA_DIR  - Path to tokenized data (default: data/tokenized)
+#   NPROC        - Number of GPUs (default: 8)
+#   DATA_DIR     - Path to tokenized data (default: data/tokenized)
+#   CUDA_DEVICES - Comma-separated GPU IDs (e.g., "0,1,2,3"). Overrides NPROC.
 
 set -euo pipefail
 
@@ -16,6 +17,13 @@ shift
 
 NPROC="${NPROC:-8}"
 DATA_DIR="${DATA_DIR:-data/tokenized}"
+
+# If CUDA_DEVICES is set, restrict to those GPUs and override NPROC
+if [ -n "${CUDA_DEVICES:-}" ]; then
+    export CUDA_VISIBLE_DEVICES="$CUDA_DEVICES"
+    # Count GPUs from comma-separated list
+    NPROC=$(echo "$CUDA_DEVICES" | tr ',' '\n' | wc -l)
+fi
 
 if [ "$MODEL_TYPE" = "cofrgenet" ]; then
     SCRIPT="scripts/03_train_cofrgenet.py"
@@ -47,5 +55,4 @@ PYTHONPATH=. torchrun \
     --nproc_per_node="$NPROC" \
     "$SCRIPT" \
     --data_dir "$DATA_DIR" \
-    --compile \
     "$@"

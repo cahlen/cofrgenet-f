@@ -32,7 +32,7 @@ Full results in [CLAUDE.md](../CLAUDE.md). These experiments motivated the large
 ### Principles
 - **Identical data**: Both models in a pair see the same tokens in the same order
 - **Identical hyperparameters**: Same optimizer, LR schedule, warmup, weight decay, batch size
-- **Same hardware**: Both trained on the same 8x B200 GPUs with DDP
+- **Same hardware**: Both trained sequentially on the same 8x B200 GPUs (baseline first, then CoFrGeNet-F)
 - **Only the FFN differs**: Standard 2-layer FFN (GELU) vs Cffn (continued fraction)
 
 ### Training Recipe (All Pairs)
@@ -45,10 +45,11 @@ Full results in [CLAUDE.md](../CLAUDE.md). These experiments motivated the large
 | Weight decay | 0.1 (on 2D weight tensors only) |
 | Gradient clipping | 1.0 (max norm) |
 | Batch size | 524,288 tokens per update |
-| Precision | bfloat16 via `torch.autocast` |
-| Parallelism | DDP across 8 GPUs (FSDP reserved for models >2B params) |
-| `torch.compile` | `mode='max-autotune'` with inductor cache |
+| Precision | bfloat16 (FSDP MixedPrecision for >2B models, `torch.autocast` for smaller) |
+| Parallelism | DDP for models <2B params, FSDP FULL_SHARD for models >=2B params — all 8 GPUs |
+| `torch.compile` | Per-pair (see individual configs — disabled for Pair 3 due to DDP dtype crash) |
 | Dyadic schedule | CoFrGeNet-F only (see Section 4) |
+| Execution | Sequential per pair: baseline trains to completion, then CoFrGeNet-F |
 
 ---
 
@@ -58,7 +59,7 @@ Full results in [CLAUDE.md](../CLAUDE.md). These experiments motivated the large
 
 **Purpose:** Sanity check at small scale. Validates the 8-GPU pipeline and establishes whether the parameter-efficiency claim holds at 450M scale.
 
-**Status:** Baseline COMPLETE. CoFrGeNet-F IN PROGRESS (step ~25K/95K).
+**Status:** Baseline COMPLETE. CoFrGeNet-F COMPLETE.
 
 | | Baseline | CoFrGeNet-F |
 |-|----------|-------------|
@@ -73,24 +74,35 @@ Full results in [CLAUDE.md](../CLAUDE.md). These experiments motivated the large
 
 **Baseline results:** Completed 95,367 steps. Final train loss 2.67, val loss 2.68. Throughput ~2.12M tok/s. Total time ~3.5 hours.
 
-**CoFrGeNet-F observations (in progress):**
+**CoFrGeNet-F results:**
 - Throughput ~800K tok/s (lower due to Cffn's sequential continuant computation)
 - Gradient norms elevated: 22-28 (vs baseline ~0.25 at same stage), clipped to 1.0
-- Loss decreasing steadily despite gradient warnings (3.58 at step 25K)
+- Final WikiText-2 PPL: 56.61 (vs baseline 23.69) — CoFrGeNet-F 2.4x worse
+- LAMBADA accuracy: 15.51% (vs baseline 26.88%)
 
-### Pair 3: 7.5B Baseline vs 4.8B CoFrGeNet-F (100B tokens)
+### Pair 3: 7.5B Baseline vs 4.8B CoFrGeNet-F (50B tokens) — IN PROGRESS
 
 **Purpose:** Key experiment. 7x beyond the IBM paper's largest scale. Tests the central claim that CoFrGeNet-F's advantage grows with model size.
+
+**Status:** Baseline training on 8x B200 (DDP, ~127K tok/s). CoFrGeNet-F queued next (FSDP + gradient checkpointing).
+
+**Note:** Originally planned for 100B tokens, reduced to 50B due to cluster time constraints (~10 days available). `torch.compile` disabled because DDP + compile triggers a dtype mismatch crash (`InternalTorchDynamoError: attempting to assign gradient with dtype 'float' to tensor with grad_dtype 'BFloat16'`) every ~90 min with the 7.5B model, preventing any checkpoint progress. The ~5% throughput loss from disabling compile is acceptable.
 
 | | Baseline | CoFrGeNet-F |
 |-|----------|-------------|
 | **Config** | `configs/experiments/pair3_baseline_7b.yaml` | `configs/experiments/pair3_cofrgenet_5b.yaml` |
 | **Params** | ~7.5B | ~4.8B (35% fewer) |
 | **Architecture** | 36L, 4096d, 32h, standard FFN | 36L, 4608d, 36h, L=3, d=5 |
-| **Data** | 100B tokens (190,734 steps) | 100B tokens (190,734 steps) |
+| **Data** | 50B tokens (95,367 steps) | 50B tokens (95,367 steps) |
 | **LR** | 3e-4 (cosine decay) | 3e-4 (cosine decay) |
 | **Warmup** | 2,000 steps | 2,000 steps |
-| **micro_batch_size** | 4 | 4 |
+| **micro_batch_size** | 16 | 16 |
+| **compile** | false | false |
+| **Parallelism** | DDP (8 GPUs) | FSDP FULL_SHARD (8 GPUs) + gradient checkpointing |
+| **Checkpoints** | `checkpoints/pair3-baseline-7b/` | `checkpoints/pair3-cofrgenet-5b/` |
+| **data_dir** | `data/tokenized_50b` | `data/tokenized_50b` |
+
+**Why FSDP for CoFrGeNet-F but DDP for baseline?** The 4.8B CoFrGeNet-F model's Cffn layers create activation tensors of shape `(batch, seq, hidden, depth)` per ladder — with p=4608, d=5, 3 ladders, 36 layers, activation memory dominates even though the model has fewer parameters. DDP (full model per GPU) OOMs even at mbs=4 on 4 GPUs. FSDP shards the model across all 8 GPUs. The 7.5B baseline's standard FFN is more memory-efficient per parameter, so DDP works.
 
 ### Pair 4: 9.9B Baseline vs 7.8B CoFrGeNet-F (100B tokens)
 
@@ -138,7 +150,7 @@ For Pair 1 (95,367 total steps):
 | 3 | 83,446 | 87.5% |
 | 4 | 89,407 | 93.75% |
 
-Implementation: `Cffn.set_active_depth()` installs `register_hook` callbacks that zero out gradients for frozen depth columns. See `src/cofrgenet/cffn.py`.
+Implementation: `Cffn.set_active_depth()` sets the active depth, and the forward pass **detaches frozen depth columns** from the computation graph. Frozen columns still contribute to the output (preserving training dynamics) but receive no gradients. This approach replaced an earlier gradient-zeroing method (`zero_frozen_grads()`) which failed under FSDP because FSDP flattens parameters to 1D shards, making column-level gradient zeroing impossible. The detach-in-forward approach works with DDP, FSDP, and single-GPU training. See `src/cofrgenet/cffn.py`.
 
 **Source:** Section 3.3 of [arXiv:2601.21766](https://arxiv.org/abs/2601.21766).
 
@@ -272,4 +284,4 @@ Results will be added to this document as each pair completes.
 
 ---
 
-*Last updated: 2026-03-11*
+*Last updated: 2026-03-12*

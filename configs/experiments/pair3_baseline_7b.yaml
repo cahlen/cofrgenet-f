@@ -1,16 +1,19 @@
 # Pair 3: 7.5B Baseline — key experiment, 7x beyond paper scale
 # 36 layers, 4096 hidden, 32 heads — GPT-2 style architecture
+# Sequential on 8 GPUs (DDP), then CoFrGeNet-F after
 n_layer: 36
 n_embd: 4096
 n_head: 32
 block_size: 1024
-total_steps: 190734   # 100B tokens / 524288 batch_tokens
+total_steps: 95367    # 50B tokens / 524288 batch_tokens
 warmup_steps: 2000
 lr: 3.0e-4
 weight_decay: 0.1
 batch_tokens: 524288
-micro_batch_size: 4
+micro_batch_size: 16
+compile: false
+data_dir: data/tokenized_50b
 checkpoint_dir: checkpoints/pair3-baseline-7b
-save_interval: 5000
+save_interval: 2000
 eval_interval: 1000
 trackio_group: pair3-7b

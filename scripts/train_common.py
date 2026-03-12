@@ -491,8 +491,8 @@ def train_loop(
                 )
                 throughput_alert_step = step
 
-        # Periodic trackio sync to HF Space (every 500 steps)
-        if rank == 0 and trackio_space and step % 500 == 0:
+        # Periodic trackio sync to HF Space (every 100 steps)
+        if rank == 0 and trackio_space and step % 100 == 0:
             try:
                 import trackio
                 trackio.sync(

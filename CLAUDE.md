@@ -6,34 +6,32 @@ An open-source implementation of CoFrGeNet-F, a continued fraction architecture 
 
 **Goal:** Train CoFrGeNet-F models at multiple scales and compare head-to-head against standard Transformer baselines on identical data. Release both with benchmarks, Gradio demo, and technical write-up.
 
-## Current Status (2026-03-06)
+## Current Status (2026-03-12)
 
 ### Completed
 - **All core architecture**: continuant.py, cffn.py, both models, configs, tests
-- **Data pipeline**: FineWeb-Edu 10BT downloaded and tokenized (100 train shards + 1 val shard in `data/tokenized/`)
-- **Training infrastructure**: shared training loop, dyadic schedule, checkpointing, CLI args for model dimensions
-- **Baseline model (124M)**: Fully trained (19,073 steps on RTX 5090, ~19.7 hours, ~141K tok/s)
-- **CoFrGeNet-F 82M (Experiment 1)**: Fully trained (19,073 steps on H200, ~37.3 hours, ~74K tok/s)
+- **Data pipeline**: FineWeb-Edu 10BT (in `data/tokenized/`) and 50BT (in `data/tokenized_50b/`)
+- **Training infrastructure**: shared training loop, dyadic schedule, checkpointing, DDP/FSDP, auto-restart, YAML configs
+- **Prior single-GPU experiments 1–3**: 82M, 128M, 128M-L8 on RTX 5090 / H200 (10B tokens each)
 - **Evaluation script**: `scripts/04_evaluate.py` — WikiText-2, WikiText-103, LAMBADA, throughput, generation speed
-- **All models evaluated**: Head-to-head on same H200, same code (see Results below)
-- **CoFrGeNet-F 128M (Experiment 2)**: Fully trained (19,073 steps on H200, ~24.3 hours, ~114K tok/s with `torch.compile`)
-- **HuggingFace repo**: Public at [`cahlen/cofrgenet-f`](https://huggingface.co/cahlen/cofrgenet-f) with both model weights + eval results
+- **HuggingFace repo**: Public at [`cahlen/cofrgenet-f`](https://huggingface.co/cahlen/cofrgenet-f) with model weights + eval results
 - **GitHub Wiki**: 7 pages of detailed architecture + math documentation
+- **DGX B200 Pair 1** (450M baseline vs 410M CoFrGeNet-F, 50B tokens): Both complete. Baseline PPL 23.69, CoFrGeNet-F PPL 56.61.
 
 ### In Progress
-- **CoFrGeNet-F 128M L=8 (Experiment 3)**: Training on H200 GPU 2, container `cofrgenet-L8`. ETA ~March 10.
+- **DGX B200 Pair 3** (7.5B baseline vs 4.8B CoFrGeNet-F, 50B tokens): Baseline training on 8x B200 (~127K tok/s). CoFrGeNet-F queued next (FSDP). See `docs/EXPERIMENTS.md`.
 
 ### Remaining
-- Evaluate Experiment 3 and add to comparison
+- Evaluate Pair 3 and add to comparison
+- Pairs 4–5 (contingent on cluster time)
+- Gradient stabilization experiments (post-pair training)
 - `scripts/05_generate_examples.py` — text generation comparison
 - `demo/app.py` — Gradio demo (side-by-side generation)
 - Blog post / technical write-up
 
-## Experiments
+## Prior Single-GPU Experiments (10B tokens)
 
-### Why Multiple Experiments?
-
-The paper's strongest results were at GPT-2 XL scale (985M CoFrGeNet-F vs 1.5B baseline). Our Experiment 1 at 82M (34% fewer params than baseline) showed CoFrGeNet-F underperforming. Experiment 2 matched the baseline's parameter count and showed improvement. Experiment 3 tests whether more continued fraction ladders (L=8 vs L=3) further closes the gap — each ladder is an independent rational approximation, so more ladders give a richer function space at negligible parameter cost.
+These early experiments were run on single GPUs (RTX 5090 / H200) before the DGX B200 paired experiments. They motivated the larger-scale runs. The IBM paper showed CoFrGeNet-F's advantage only emerging at GPT-2 XL scale (~1B params).
 
 ### Experiment 1: Parameter-Efficient (82M vs 124M)
 
@@ -89,8 +87,34 @@ Trained on H200 GPU 2, ~114K tok/s with `torch.compile`, 24.3 hours.
 | CoFrGeNet-F (Exp 2) | 12L, 1024d, 16h, L=3 ladders, d=5 depth | 128,256,000 |
 | CoFrGeNet-F (Exp 3) | 12L, 1024d, 16h, L=8 ladders, d=5 depth | 128,624,640 |
 
-**Status:** Training on H200 GPU 2, container `cofrgenet-L8`, ~54K tok/s (with `torch.compile`, micro_batch_size=8), ETA ~51 hours (~March 10 04:00 UTC).
-**Checkpoints:** `checkpoints/cofrgenet-128m-L8/` (every 1K steps)
+**Checkpoints:** `checkpoints/cofrgenet-128m-L8/`
+
+## DGX B200 Paired Experiments (50B–100B tokens)
+
+The main experiments train matched pairs of baseline Transformers and CoFrGeNet-F models on 8x NVIDIA B200 GPUs. Each pair runs sequentially (baseline first, then CoFrGeNet-F) on identical data with identical hyperparameters. Full details in [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md).
+
+### Pair 1: 450M Baseline vs 410M CoFrGeNet-F (50B tokens) — COMPLETE
+
+| Metric | Baseline (450M) | CoFrGeNet-F (410M) |
+|--------|-----------------|-------------------|
+| WikiText-2 PPL | **23.69** | 56.61 |
+| LAMBADA Acc | **26.88%** | 15.51% |
+| Throughput | **2.12M** tok/s | 800K tok/s |
+
+CoFrGeNet-F 2.4x worse on perplexity. Consistent with IBM paper — advantage only emerges at larger scale.
+
+### Pair 3: 7.5B Baseline vs 4.8B CoFrGeNet-F (50B tokens) — IN PROGRESS
+
+| | Baseline | CoFrGeNet-F |
+|-|----------|-------------|
+| **Params** | ~7.5B | ~4.8B (35% fewer) |
+| **Architecture** | 36L, 4096d, 32h, standard FFN | 36L, 4608d, 36h, L=3, d=5 |
+| **Parallelism** | DDP (8 GPUs) | FSDP FULL_SHARD (8 GPUs) |
+| **compile** | false | false |
+| **micro_batch_size** | 16 | 16 |
+| **data_dir** | `data/tokenized_50b` | `data/tokenized_50b` |
+
+Baseline training at ~127K tok/s. CoFrGeNet-F uses FSDP because Cffn activation memory (ladder broadcasts to `(B,S,p,d)` per ladder per layer) causes OOM with DDP even at mbs=4. `torch.compile` disabled due to DDP dtype mismatch crash with 7B+ models. Dyadic schedule uses detach-in-forward (not gradient zeroing) for FSDP compatibility.
 
 ## Architecture Overview
 
@@ -138,7 +162,7 @@ where z_j = f̃(gated_x ⊙ W^(j))   for j = 1, ..., L
 
 ### Dyadic Training Schedule (CRITICAL)
 
-Without this, performance degrades 10-80%. Progressively unfreezes continued fraction depth via gradient hooks:
+Without this, performance degrades 10-80%. Progressively unfreezes continued fraction depth by detaching frozen columns in the forward pass (FSDP-compatible):
 
 ```
 Depth i parameters: unfrozen at step (1 - 1/2^i) × total_steps
@@ -161,9 +185,9 @@ For 19,073 steps: depth 1 at step 9,537, depth 2 at 14,305, depth 3 at 16,689, d
 - Config: 12L, 1024d, 16h, L=3, d=5
 - Wider hidden dim compensates for Cffn's smaller FFN
 
-## Training Recipe
+## Training Recipe (Prior Single-GPU Experiments)
 
-All models trained with identical hyperparameters on the same data.
+The prior single-GPU experiments (Exp 1–3) used these settings. DGX B200 paired experiments have per-pair configs in `configs/experiments/` — see `docs/EXPERIMENTS.md`.
 
 | Hyperparameter | Value |
 |---------------|-------|
@@ -222,15 +246,18 @@ cofrgenet-f/
 │       ├── model.py           # Standard GPT-2 (also houses shared TransformerBlock, CausalSelfAttention)
 │       └── config.py          # BaselineConfig dataclass
 ├── scripts/
-│   ├── 01_download_data.py    # Download & tokenize FineWeb-Edu 10BT
+│   ├── 01_download_data.py    # Download & tokenize FineWeb-Edu
 │   ├── 02_train_baseline.py   # Train standard transformer
 │   ├── 03_train_cofrgenet.py  # Train CoFrGeNet-F (with dyadic schedule, configurable dimensions)
-│   ├── train_common.py        # Shared: DataLoader, LR schedule, training loop, checkpointing
+│   ├── train_common.py        # Shared: DataLoader, LR schedule, training loop, DDP/FSDP, checkpointing
 │   ├── 04_evaluate.py         # Benchmark evaluation (WikiText-2/103, LAMBADA, throughput, gen speed)
+│   ├── launch_training.sh     # torchrun wrapper for multi-GPU training
+│   ├── train_with_autorestart.sh  # Auto-restart wrapper (crash recovery)
 │   └── 05_generate_examples.py # NOT YET IMPLEMENTED
 ├── configs/
 │   ├── baseline.yaml
-│   └── cofrgenet_f.yaml
+│   ├── cofrgenet_f.yaml
+│   └── experiments/           # Per-pair YAML configs (pair1_*, pair3_*, etc.)
 ├── tests/
 │   ├── test_continuant.py     # Continuant math tests
 │   ├── test_cffn.py           # Cffn layer tests
@@ -243,18 +270,23 @@ cofrgenet-f/
 │   │   └── 2026-03-01-cofrgenet-f-implementation.md
 │   └── H200_TRAINING_GUIDE.md
 ├── checkpoints/               # .gitignored
-│   ├── baseline/              # Final baseline model + eval_results.json
-│   ├── cofrgenet/             # Experiment 1: 82M model + eval_results.json
-│   └── cofrgenet-128m/        # Experiment 2: 128M model (training in progress)
+│   ├── baseline/              # Prior exp: 124M baseline + eval_results.json
+│   ├── cofrgenet/             # Prior exp 1: 82M model + eval_results.json
+│   ├── cofrgenet-128m/        # Prior exp 2: 128M model
+│   ├── pair1-baseline-450m/   # DGX Pair 1 baseline
+│   ├── pair1-cofrgenet-410m/  # DGX Pair 1 CoFrGeNet-F
+│   ├── pair3-baseline-7b/     # DGX Pair 3 baseline (training)
+│   └── pair3-cofrgenet-5b/    # DGX Pair 3 CoFrGeNet-F (queued)
 └── data/                      # .gitignored
-    └── tokenized/             # 100 train shards + 1 val shard (uint16 .bin)
+    ├── tokenized/             # 10B tokens (100 train shards + 1 val shard)
+    └── tokenized_50b/         # 50B tokens (for Pair 3+)
 ```
 
 ### Key Code Architecture Decisions
 
 - **`TransformerBlock` takes FFN as a parameter**: Both models reuse `TransformerBlock(config, ffn_module)` from `src/baseline/model.py`.
 - **Custom autograd**: `ContinuedFractionFunction` in `continuant.py` uses `torch.autograd.Function`. Proposition 1 gradients use only 1 division.
-- **Dyadic schedule via gradient hooks**: `Cffn.set_active_depth()` installs `register_hook` callbacks that zero out gradients for frozen depth columns.
+- **Dyadic schedule via forward detach**: `Cffn.set_active_depth()` controls which depth columns are active. Frozen columns are **detached in the forward pass** — they contribute to the output but receive no gradients. This replaced an earlier gradient-zeroing approach that failed under FSDP (params flattened to 1D shards). A legacy `zero_frozen_grads()` method exists as a safety fallback for non-FSDP training.
 - **Checkpointing**: `safetensors.torch.save_model` for weights, separate `.pt` for optimizer state.
 - **Weight tying**: Both models tie `lm_head.weight = tok_emb.weight`.
 - **Configurable dimensions**: `03_train_cofrgenet.py` accepts `--n_embd`, `--n_head`, `--n_layer`, `--num_ladders`, `--cf_depth`, `--checkpoint_dir` for training different model sizes.
