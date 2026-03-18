@@ -6,7 +6,7 @@ An open-source implementation of CoFrGeNet-F, a continued fraction architecture 
 
 **Goal:** Train CoFrGeNet-F models at multiple scales and compare head-to-head against standard Transformer baselines on identical data. Release both with benchmarks, Gradio demo, and technical write-up.
 
-## Current Status (2026-03-12)
+## Current Status (2026-03-18)
 
 ### Completed
 - **All core architecture**: continuant.py, cffn.py, both models, configs, tests
@@ -14,15 +14,17 @@ An open-source implementation of CoFrGeNet-F, a continued fraction architecture 
 - **Training infrastructure**: shared training loop, dyadic schedule, checkpointing, DDP/FSDP, auto-restart, YAML configs
 - **Prior single-GPU experiments 1–3**: 82M, 128M, 128M-L8 on RTX 5090 / H200 (10B tokens each)
 - **Evaluation script**: `scripts/04_evaluate.py` — WikiText-2, WikiText-103, LAMBADA, throughput, generation speed
-- **HuggingFace repo**: Public at [`cahlen/cofrgenet-f`](https://huggingface.co/cahlen/cofrgenet-f) with model weights + eval results
+- **HuggingFace repos**: [`cahlen/cofrgenet-f`](https://huggingface.co/cahlen/cofrgenet-f) (prior experiments), [`cahlen/pair3-baseline-7b`](https://huggingface.co/cahlen/pair3-baseline-7b) (Pair 3 baseline)
 - **GitHub Wiki**: 7 pages of detailed architecture + math documentation
 - **DGX B200 Pair 1** (450M baseline vs 410M CoFrGeNet-F, 50B tokens): Both complete. Baseline PPL 23.69, CoFrGeNet-F PPL 56.61.
+- **DGX B200 Pair 3 Baseline** (7.5B, 50B tokens): Training complete (95,367 steps, ~5.5 days on 8x B200). Evaluated. Uploaded to HuggingFace.
+- **Code audit**: Full audit of continuant math, Cffn architecture, dyadic schedule, and training loop against the paper. All correct.
 
 ### In Progress
-- **DGX B200 Pair 3** (7.5B baseline vs 4.8B CoFrGeNet-F, 50B tokens): Baseline training on 8x B200 (~127K tok/s). CoFrGeNet-F queued next (FSDP). See `docs/EXPERIMENTS.md`.
+- **DGX B200 Pair 3 CoFrGeNet-F** (4.8B, 50B tokens): Queued to launch on 8x B200 (FSDP). Config at `configs/experiments/pair3_cofrgenet_5b.yaml`. This is the key experiment — does CoFrGeNet-F's advantage emerge at 7B+ scale?
 
 ### Remaining
-- Evaluate Pair 3 and add to comparison
+- Evaluate Pair 3 CoFrGeNet-F and compare against baseline at matching steps
 - Pairs 4–5 (contingent on cluster time)
 - Gradient stabilization experiments (post-pair training)
 - `scripts/05_generate_examples.py` — text generation comparison
@@ -103,18 +105,43 @@ The main experiments train matched pairs of baseline Transformers and CoFrGeNet-
 
 CoFrGeNet-F 2.4x worse on perplexity. Consistent with IBM paper — advantage only emerges at larger scale.
 
-### Pair 3: 7.5B Baseline vs 4.8B CoFrGeNet-F (50B tokens) — IN PROGRESS
+### Pair 3: 7.5B Baseline vs 4.8B CoFrGeNet-F (50B tokens)
 
 | | Baseline | CoFrGeNet-F |
 |-|----------|-------------|
 | **Params** | ~7.5B | ~4.8B (35% fewer) |
 | **Architecture** | 36L, 4096d, 32h, standard FFN | 36L, 4608d, 36h, L=3, d=5 |
-| **Parallelism** | DDP (8 GPUs) | FSDP FULL_SHARD (8 GPUs) |
+| **Parallelism** | FSDP FULL_SHARD (8 GPUs) | FSDP FULL_SHARD (8 GPUs) |
 | **compile** | false | false |
-| **micro_batch_size** | 16 | 16 |
+| **micro_batch_size** | 64 | 16 |
+| **save_interval** | 2000 | 5000 |
 | **data_dir** | `data/tokenized_50b` | `data/tokenized_50b` |
+| **Status** | **COMPLETE** | **QUEUED** |
 
-Baseline training at ~127K tok/s. CoFrGeNet-F uses FSDP because Cffn activation memory (ladder broadcasts to `(B,S,p,d)` per ladder per layer) causes OOM with DDP even at mbs=4. `torch.compile` disabled due to DDP dtype mismatch crash with 7B+ models. Dyadic schedule uses detach-in-forward (not gradient zeroing) for FSDP compatibility.
+Both models use FSDP FULL_SHARD (>2B params triggers FSDP in `train_common.py`). Baseline runs at mbs=64 (grad_accum=1), CoFrGeNet-F at mbs=16 (grad_accum=4) due to Cffn activation memory (ladder broadcasts to `(B,S,p,d)` per ladder per layer). Effective batch size is identical (524,288 tokens/step). `torch.compile` disabled due to dtype mismatch crash with 7B+ models. Dyadic schedule uses detach-in-forward (not gradient zeroing) for FSDP compatibility.
+
+#### Pair 3 Baseline Results (COMPLETE)
+
+Trained ~5.5 days on 8x B200 at ~132,800 tok/s. Model is massively overparameterized for 50B tokens (Chinchilla optimal would be ~150B), so it overfits heavily. Best generalization at step 10K, final checkpoint memorized the training set (train loss 0.008).
+
+| Metric | Step 10K (Best LLM) | Step 20K | Step 95K (Final) |
+|--------|---------------------|----------|-----------------|
+| WikiText-2 PPL | **39.52** | 52.21 | 2,952,579 |
+| LAMBADA Acc | **15.89%** | 13.12% | 6.31% |
+| Throughput | 29,561 tok/s | 26,799 tok/s | 55,693 tok/s |
+
+**Checkpoints kept:** step 10K (best generalization), step 20K (reference), step 95K (final for comparison). All others deleted to save disk. HuggingFace: [`cahlen/pair3-baseline-7b`](https://huggingface.co/cahlen/pair3-baseline-7b).
+
+**Baseline val loss curve** logged at every 1,000 steps in `logs/pair3_baseline_7b.log` for direct comparison with CoFrGeNet-F at matching steps.
+
+#### Pair 3 CoFrGeNet-F (QUEUED)
+
+Key questions:
+1. Does CoFrGeNet-F's val loss ever beat the baseline's best (2.94 at step 8K)?
+2. At what step does the crossover happen, if at all?
+3. How does the learning curve compare at matching steps throughout training?
+
+CoFrGeNet-F saves checkpoints every 5K steps and evals every 1K steps, matching the baseline's eval resolution for head-to-head comparison.
 
 ## Architecture Overview
 
@@ -275,7 +302,7 @@ cofrgenet-f/
 │   ├── cofrgenet-128m/        # Prior exp 2: 128M model
 │   ├── pair1-baseline-450m/   # DGX Pair 1 baseline
 │   ├── pair1-cofrgenet-410m/  # DGX Pair 1 CoFrGeNet-F
-│   ├── pair3-baseline-7b/     # DGX Pair 3 baseline (training)
+│   ├── pair3-baseline-7b/     # DGX Pair 3 baseline (COMPLETE: step 10K, 20K, 95K kept)
 │   └── pair3-cofrgenet-5b/    # DGX Pair 3 CoFrGeNet-F (queued)
 └── data/                      # .gitignored
     ├── tokenized/             # 10B tokens (100 train shards + 1 val shard)
@@ -293,9 +320,10 @@ cofrgenet-f/
 
 ## HuggingFace
 
-- **Repo:** [`cahlen/cofrgenet-f`](https://huggingface.co/cahlen/cofrgenet-f) (public)
-- **Structure:** `cofrgenet/model.safetensors`, `baseline/model.safetensors`, `src/`, eval results
-- **Model card:** LaTeX math, head-to-head comparison table, full architecture docs
+- **Prior experiments:** [`cahlen/cofrgenet-f`](https://huggingface.co/cahlen/cofrgenet-f) — 82M, 128M models + eval results
+- **Pair 3 baseline:** [`cahlen/pair3-baseline-7b`](https://huggingface.co/cahlen/pair3-baseline-7b) — step 10K (best LLM) + step 95K (final), eval results, detailed model card
+- **Pair 3 CoFrGeNet-F:** `cahlen/pair3-cofrgenet-5b` (to be created after training)
+- **Trackio dashboard:** [`cahlen/cofrgenet-f-trackio`](https://huggingface.co/spaces/cahlen/cofrgenet-f-trackio) — live training metrics
 - **Note:** HuggingFace does NOT support inline `$...$` math — only `$$` display blocks. GitHub supports both.
 
 ## Reference Links

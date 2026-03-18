@@ -58,9 +58,9 @@ Key experiment — **7× beyond the IBM paper's largest scale**. Tests the centr
 | **Parameters** | ~7.5B | ~4.8B (35% fewer) |
 | **Architecture** | 36L, 4096d, 32h, standard FFN | 36L, 4608d, 36h, Cffn (L=3, d=5) |
 | **Data** | 50B tokens (95,367 steps) | 50B tokens (95,367 steps) |
-| **Parallelism** | DDP (8 GPUs) | FSDP (8 GPUs) + gradient checkpointing |
+| **Parallelism** | FSDP (8 GPUs) | FSDP (8 GPUs) + gradient checkpointing |
 
-Baseline training at ~127K tok/s. CoFrGeNet-F queued next. `torch.compile` disabled for both (DDP dtype crash with 7B+ models).
+Baseline training at ~132K tok/s (mbs=64). CoFrGeNet-F queued next (mbs=16 due to Cffn activation memory). `torch.compile` disabled for both (dtype crash with 7B+ models).
 
 ### Pairs 4–5 (Planned, contingent on cluster time)
 
@@ -165,7 +165,7 @@ docker run --gpus all \
 | Gradient clipping | 1.0 max norm | 1.0 max norm | 1.0 max norm |
 | Batch size | 524,288 tokens/update | 524,288 tokens/update | 524,288 tokens/update |
 | Precision | bfloat16 | bfloat16 | bfloat16 |
-| Parallelism | DDP (8× B200) | DDP / FSDP (8× B200) | FSDP (8× B200) |
+| Parallelism | DDP (8× B200) | FSDP (8× B200) | FSDP (8× B200) |
 | torch.compile | true (max-autotune) | false (DDP dtype crash) | TBD |
 
 CoFrGeNet-F additionally uses a **dyadic training schedule** that progressively unfreezes continued fraction depth levels — without this, the paper reports 10–80% performance degradation:

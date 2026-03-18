@@ -17,6 +17,6 @@ micro_batch_size: 16
 compile: false
 data_dir: data/tokenized_50b
 checkpoint_dir: checkpoints/pair3-cofrgenet-5b
-save_interval: 2000
+save_interval: 5000
 eval_interval: 1000
 trackio_group: pair3-7b

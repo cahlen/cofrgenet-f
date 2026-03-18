@@ -10,7 +10,7 @@ warmup_steps: 2000
 lr: 3.0e-4
 weight_decay: 0.1
 batch_tokens: 524288
-micro_batch_size: 16
+micro_batch_size: 64
 compile: false
 data_dir: data/tokenized_50b
 checkpoint_dir: checkpoints/pair3-baseline-7b

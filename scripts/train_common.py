@@ -380,6 +380,7 @@ def train_loop(
     # Alert tracking state
     prev_val_loss = None
     loss_history = []
+    loss_accum = 0.0  # initialize before loop (needed if resume_step == total_steps)
     throughput_baseline = None  # established after torch.compile warmup
     throughput_alert_step = 0   # throttle throughput alerts
 
@@ -548,11 +549,12 @@ def train_loop(
             "info", wandb_run,
         )
 
-    # Save final checkpoint
+    # Save final checkpoint (skip if already saved at last step inside the loop)
     final_path = os.path.join(checkpoint_dir, "final.safetensors")
-    save_checkpoint_fsdp(model, optimizer, step, loss_accum, final_path, rank=rank)
-    if rank == 0:
-        print(f"Final checkpoint: {final_path}")
+    if step == total_steps and not os.path.exists(os.path.join(checkpoint_dir, f"step_{step:06d}.safetensors")):
+        save_checkpoint_fsdp(model, optimizer, step, loss_accum, final_path, rank=rank)
+        if rank == 0:
+            print(f"Final checkpoint: {final_path}")
 
 
 def _fire_alert(title, text, level, wandb_run):

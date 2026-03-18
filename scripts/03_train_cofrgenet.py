@@ -187,6 +187,7 @@ def main():
                 space_id=args.trackio_space,
                 auto_log_gpu=True,
                 gpu_log_interval=30.0,
+                resume="allow" if resume_step > 0 else "never",
             )
             if args.trackio_group:
                 init_kwargs["group"] = args.trackio_group

@@ -96,13 +96,13 @@ Full results in [CLAUDE.md](../CLAUDE.md). These experiments motivated the large
 | **Data** | 50B tokens (95,367 steps) | 50B tokens (95,367 steps) |
 | **LR** | 3e-4 (cosine decay) | 3e-4 (cosine decay) |
 | **Warmup** | 2,000 steps | 2,000 steps |
-| **micro_batch_size** | 16 | 16 |
+| **micro_batch_size** | 64 | 16 |
 | **compile** | false | false |
-| **Parallelism** | DDP (8 GPUs) | FSDP FULL_SHARD (8 GPUs) + gradient checkpointing |
+| **Parallelism** | FSDP FULL_SHARD (8 GPUs) | FSDP FULL_SHARD (8 GPUs) + gradient checkpointing |
 | **Checkpoints** | `checkpoints/pair3-baseline-7b/` | `checkpoints/pair3-cofrgenet-5b/` |
 | **data_dir** | `data/tokenized_50b` | `data/tokenized_50b` |
 
-**Why FSDP for CoFrGeNet-F but DDP for baseline?** The 4.8B CoFrGeNet-F model's Cffn layers create activation tensors of shape `(batch, seq, hidden, depth)` per ladder — with p=4608, d=5, 3 ladders, 36 layers, activation memory dominates even though the model has fewer parameters. DDP (full model per GPU) OOMs even at mbs=4 on 4 GPUs. FSDP shards the model across all 8 GPUs. The 7.5B baseline's standard FFN is more memory-efficient per parameter, so DDP works.
+Both models use FSDP FULL_SHARD (the code's 2B param threshold routes both to FSDP). Baseline runs mbs=64 (grad_accum=1), CoFrGeNet-F runs mbs=16 (grad_accum=4) — effective batch size is identical (524,288 tokens/step). CoFrGeNet-F needs smaller micro-batches because its Cffn layers create activation tensors of shape `(batch, seq, hidden, depth)` per ladder — with p=4608, d=5, 3 ladders, 36 layers, activation memory dominates even though the model has fewer parameters.
 
 ### Pair 4: 9.9B Baseline vs 7.8B CoFrGeNet-F (100B tokens)
 
